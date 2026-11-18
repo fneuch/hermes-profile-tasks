@@ -48,7 +48,7 @@ profile served by the same Hermes gateway.
   bypassed (yolo or mode off) nothing is passed on and the target request stays pending. If the
   target request ends (expired, answered in the target session, turn interrupted) while the card is
   open, the card is withdrawn and the manager is told the real ending; an answer that reaches the
-  plugin after that ending is not recorded as pending.
+  plugin after that ending is not recorded as pending nor sent to the target session.
   After the wait limit the plugin keeps watching the target turn (up to 24 h) only to relay approvals.
 - Targets: every profile the gateway serves (`gateway_state.json` `served_profiles`) except the caller.
 - The target runs with its own config, MCP servers and tokens. The manager only gets text back.

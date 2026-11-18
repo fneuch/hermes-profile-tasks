@@ -639,7 +639,9 @@ class ProfileTasks:
                     relay["forwarded"] = True
                     self.store.update(task_id, pending_approval={**current, "relayed": True,
                                                                  "relayed_choice": choice})
-            answer = self._run_async(self._respond(task, pending, choice))
+            # The target request ended as the answer came in: nothing is sent to the target session.
+            answer = (self._run_async(self._respond(task, pending, choice)) if relay.get("forwarded") else
+                      {"ok": False, "error": "the approval in the target session had already ended"})
         finally:
             with self._relay_lock:
                 self._relays.pop(prompt_id, None)
