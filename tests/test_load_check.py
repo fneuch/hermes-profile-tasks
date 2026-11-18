@@ -1,6 +1,7 @@
 """Load-time check of the profile-tasks plugin: present internals pass, a removed one blocks the tool.
 
-Run: ``tests/run_unit.sh`` (isolated HOME/HERMES_HOME, the installed Hermes interpreter).
+Run: ``PT_SCRIPT=tests/test_load_check.py e2e/run.sh`` (isolated HOME/HERMES_HOME, the installed Hermes
+interpreter).
 """
 
 from __future__ import annotations

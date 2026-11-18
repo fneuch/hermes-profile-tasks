@@ -9,23 +9,39 @@ profile served by the same Hermes gateway.
   `hermes://open/<session id>` link.
 - When the target's turn ends, its final text is injected once into the calling manager
   conversation (`ctx.inject_message`), which starts a manager turn.
-- `follow_up`: sends a new text to the same session (same context).
+- `follow_up`: sends a new text to the same session (same context). Refused while the task's turn
+  is still running (or its state cannot be read): use `correct` for that turn, or send the
+  follow-up after its answer arrives.
 - `correct`: steers the running turn of the task (`prompt.receipt` then `session.steer`).
 - `status`: lists the tasks from the plugin state and the allowed targets. For a task nobody waits on
   any more (past the wait limit, a wait cut off, or a gateway restart, detected by the waiting
-  process being gone) it reads the target turn's receipt: a late answer is returned once in the
-  status result (not injected); a turn cut off by the restart is reported with its state
+  process being gone) it reads the target turn's receipt. A late answer comes back in the status
+  result and is never injected; later status calls for that task return the stored answer without
+  reading the target again. A turn cut off by the restart is reported with its state
   (`interrupted`, or `unknown`, in which case the target session stays paused until a person
-  resends or discards the turn in the desktop).
+  resends or discards the turn in the desktop). Status also lists, per task, the last approval's
+  outcome and any notice the manager conversation has not taken yet.
+- Notices to the manager conversation (answers, wait limit, approvals, restarts) are kept in the
+  plugin state until that conversation takes them. A refused one is retried, in order, at the start
+  of the next `profile_task` call or at the next event of its task; the gateway refuses a
+  conversation that no client has open.
+- Gateway restart: when the plugin loads, it finds the tasks whose waiting process is gone, marks
+  them (`wait_lost`, or `failed` if the target never accepted the task), closes any approval that
+  was open (the command did not run), and queues one notice per task to its manager conversation.
+  It sends them once the gateway accepts plugin messages, then as above.
 - Wait limit: 30 minutes by default. Past it the manager gets a message: no answer yet, the work
   is not cancelled, check back with `status`.
 - Approvals in a task session: the plugin's connection to the target session sees its
   `approval.request` at once and injects a notice into the manager conversation (command, task,
   session, `hermes://open/<session>` link, expiry time from the target profile's
-  `approvals.timeout`). If the request expires unanswered, a second notice says so and that the
-  command did not run. `approval` (action) shows the approve/deny prompt in the manager
+  `approvals.timeout`). When the request ends, a second notice gives the real outcome, read from the
+  gated tool's result (its approval summary): approved and run, denied, expired, withdrawn, or
+  ended with the turn. `approval` (action) shows the approve/deny prompt in the manager
   conversation itself; the choice made there (`once`, `session`, `always`, `deny`) is sent to the
-  target session with `approval.respond`, so the command runs there. Limits: the prompt opens only
+  target session with `approval.respond`, so the command runs there. `always` permanently allows
+  that kind of command in the target profile (its `command_allowlist`) and leaves one inert rule in
+  the manager profile's config (`plugin_rule:profile_task_relay:<prompt id>`, one per relayed
+  prompt, never matched again); the prompt's own text says so. Limits: the prompt opens only
   when the manager turn calls `approval` (a plugin cannot open an approval prompt in a conversation
   with no running turn); its card title is the generic plugin rule, the target command is in its
   description; it uses the manager profile's approval timeout, and if the manager's approvals are
@@ -66,10 +82,12 @@ Both run against an isolated Hermes home under `~/.cache/profile-tasks-e2e/<time
 only read (code and interpreter).
 
 - `PT_SCRIPT=tests/test_load_check.py e2e/run.sh`: load-time check, with all internals and with one removed.
-- `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets restart`). Evidence
-  is written to `e2e/evidence/run-<timestamp>.json`. The analyst profile gets a fixture MCP server
-  named `atlassian` (from the Hermes test fixtures) whose answer carries a per-run token set only
-  in the analyst config.
+- `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets restart followup
+  retry approval`; `approval` runs last because its relayed `always` permanently allows recursive
+  delete in the isolated analyst profile). Evidence is written to `e2e/evidence/run-<timestamp>.json`. The analyst profile gets
+  a fixture MCP server named `atlassian` (from the Hermes test fixtures) whose answer carries a
+  per-run token set only in the analyst config. The default (manager) profile gets MCP servers
+  like the live one: an enabled fixture server named `notion` and a disabled `atlassian` entry.
 
 `e2e/run.sh` stops the isolated gateway on every exit (end, failure, Ctrl-C, TERM) through that
 home's own control socket (`e2e/stop_gateway.py HERMES_HOME`, which refuses the real `~/.hermes`).

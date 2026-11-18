@@ -40,6 +40,8 @@ assert HH == HOME / ".hermes"
 FIXTURE_MCP = AGENT / "tests/e2e/core/parity/fixture_mcp_server.py"
 MCP_TOOL = "mcp__atlassian__parity_canary"
 CANARY = "ANALYST-ONLY-" + uuid.uuid4().hex[:10]
+MANAGER_CANARY = "MANAGER-OWN-" + uuid.uuid4().hex[:10]
+MANAGER_MCP_TOOL = "mcp__notion__parity_canary"
 EVIDENCE: dict = {"base": str(HOME.parent), "canary": CANARY, "checks": []}
 WAIT_LIMIT = 25
 HANG_SECONDS = 45
@@ -77,6 +79,8 @@ def scenario_of(messages: list[dict]) -> tuple[str, int]:
 
 RELAY = {"on": False}
 APPROVAL_TIMEOUT = 10
+# Lets the trial close the manager conversation before the target raises its approval.
+LATE_APPROVAL_DELAY = 12
 
 
 def manager_model(record: dict):
@@ -127,7 +131,9 @@ def analyst_model(record: dict):
         if after_user and "CORRECTION-" in text_of(messages[-1]):
             return Text("LATE-SECOND-TURN handled the correction", reasoning=reasoning)
         return Text("LATE-FINAL " + "x" * 120, reasoning=reasoning, chunk_chars=4, delay_per_chunk=0.25)
-    if tag in ("APPROVAL", "RELAY"):
+    if tag.startswith("RELAY") or tag.startswith("APPROVAL"):
+        if not tool_results and tag == "APPROVALLATE":
+            time.sleep(LATE_APPROVAL_DELAY)
         if not tool_results:
             return ToolCall("terminal", {"command": f"rm -rf {HOME}/{tag.lower()}-probe-dir"})
         return Text(f"{tag}-RESULT {text_of(tool_results[-1])[:400]}", reasoning=reasoning)
@@ -159,11 +165,17 @@ def write_home(manager_url: str, analyst_url: str) -> None:
     def model(url: str) -> dict:
         return {"provider": "custom", "base_url": url, "default": MODEL_ID, "context_length": 128000}
 
+    def fixture_mcp(canary: str, enabled: bool = True) -> dict:
+        return {"command": sys.executable, "args": [str(FIXTURE_MCP)], "enabled": enabled,
+                "env": {"PARITY_MCP_CANARY": canary, "PYTHONPATH": str(AGENT)},
+                "connect_timeout": 60, "timeout": 60}
+
+    # Like the live default profile: enabled servers of its own, and a disabled `atlassian` entry.
     default = dict(common, model=model(manager_url), gateway={"multiplex_profiles": True}, plugins={
         "enabled": ["profile-tasks"],
         "entries": {"profile-tasks": {"allow_gateway_injection": True,
                                       "settings": {"wait_timeout_seconds": WAIT_LIMIT}}},
-    })
+    }, mcp_servers={"notion": fixture_mcp(MANAGER_CANARY), "atlassian": fixture_mcp(MANAGER_CANARY, enabled=False)})
     analyst = dict(common, model=model(analyst_url), display={"show_reasoning": True},
                    approvals={"mode": "smart", "timeout": APPROVAL_TIMEOUT},
                    mcp_servers={"atlassian": {"command": sys.executable, "args": [str(FIXTURE_MCP)],
@@ -289,6 +301,15 @@ def manager_got(server: FakeLLMServer, needle: str) -> str | None:
     return None
 
 
+def manager_saw(server: FakeLLMServer, needle: str) -> str | None:
+    """The first non-assistant message, at any position of any manager model request, that contains *needle*.
+
+    A message injected while a manager turn runs can reach the model inside that turn, not as a user message.
+    """
+    return next((text_of(m) for body in server.main_requests() for m in body["messages"]
+                 if m.get("role") != "assistant" and needle in text_of(m)), None)
+
+
 def analyst_db(sql: str, args: tuple = ()) -> list[tuple]:
     with sqlite3.connect(f"file:{HH / 'profiles/analyst/state.db'}?mode=ro", uri=True) as db:
         return db.execute(sql, args).fetchall()
@@ -341,10 +362,14 @@ async def trial_1_2_3(ctx) -> None:
         mgr_mcp = sorted({n for b in ctx["m"].main_requests() for n in offered_mcp(b)})
         ana_mcp = sorted({n for b in ctx["a"].main_requests() for n in offered_mcp(b)})
         mgr_catalog = json.dumps(ctx["m"].main_requests()[0].get("tools") or [])
-        check("1", MCP_TOOL in ana_mcp and not mgr_mcp,
-              "the analyst session is offered the atlassian MCP tool, the manager is offered no MCP tool",
+        check("1", MCP_TOOL in ana_mcp and MANAGER_MCP_TOOL in mgr_mcp
+              and not any(n.startswith("mcp__atlassian__") for n in mgr_mcp) and MANAGER_MCP_TOOL not in ana_mcp,
+              "with MCP servers of its own (notion enabled, atlassian disabled), the manager is offered only its "
+              "own enabled server's tools and none of the analyst's; the analyst is offered its atlassian tool",
               analyst_mcp_tools=ana_mcp, manager_mcp_tools=mgr_mcp, manager_direct_tools=mgr_tools,
-              manager_catalog_has_profile_task="profile_task" in mgr_catalog)
+              manager_catalog_has_profile_task="profile_task" in mgr_catalog,
+              manager_mcp_servers_enabled={n: c["enabled"] for n, c in
+                                           EVIDENCE["configs"]["default"]["mcp_servers"].items()})
         await until(lambda: any(f.get("type") == "message.complete" and "MANAGER-WOKE" in json.dumps(f)
                                 for f in mgr.frames), 60, "manager woke")
         woke = [f for f in mgr.frames if f.get("type") == "message.complete"]
@@ -408,61 +433,120 @@ async def answer_of(ctx, mgr: Client, sid: str, task_id: str) -> str:
     raise TimeoutError(f"answer of {task_id}")
 
 
+def plugin_task(task_id: str) -> dict:
+    """The task as the plugin stored it (isolated home's plugin state file)."""
+    for path in (HH / "plugin-data").glob("*/state.json"):
+        tasks = json.loads(path.read_text()).get("tasks") or {}
+        if task_id in tasks:
+            return tasks[task_id]
+    return {}
+
+
+# How each target-side ending is caused, the outcome the plugin must record, and the notice words.
+APPROVAL_ENDINGS = {
+    "APPROVAL": ("expire", ("timeout",), "expired unanswered", True),
+    "APPROVALOK": ("approve", ("ran",), "was approved in the analyst session; the command ran", False),
+    "APPROVALDENY": ("deny", ("denied",), "was denied in the analyst session; the command did not run", True),
+    "APPROVALINT": ("interrupt", ("cancelled", "interrupted"), "did not run", True),
+}
+
+
 async def trial_approval(ctx) -> None:
-    """Item 4: a target approval is reported at once, expires visibly, and can be answered from the manager."""
-    # Unanswered: the notice arrives before expiry, then the expiry outcome.
-    async with Client("default") as mgr:
-        sid = await manager_session(mgr)
-        (HOME / "approval-probe-dir").mkdir(exist_ok=True)
-        ack = await start_task(ctx, mgr, sid, "APPROVAL", "approval expiry")
-        task_id, asid = ack["task_id"], ack["session_id"]
-        notice = await until(lambda: manager_got(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval"),
-                             APPROVAL_TIMEOUT, "approval notice")
-        notice_at = time.time()
-        expired = await until(lambda: manager_got(ctx["m"], f"Task {task_id} (analyst): the approval for"),
-                              APPROVAL_TIMEOUT + 60, "expiry notice")
-        expired_at = time.time()
-        final = await answer_of(ctx, mgr, sid, task_id)
-        check("approval", f"hermes://open/{asid}" in notice and "approval-probe-dir" in notice
-              and "action=approval" in notice and expired_at - notice_at > APPROVAL_TIMEOUT - 3,
-              "unanswered approval: the manager got the command, task, session and link while it was answerable",
-              notice=notice, seconds_notice_before_expiry=round(expired_at - notice_at, 1))
-        check("approval", "expired unanswered" in expired and "did not run" in expired
-              and (HOME / "approval-probe-dir").exists(),
-              "unanswered approval: the manager got the expiry outcome, and the command did not run",
-              expiry_notice=expired, probe_dir_exists=(HOME / "approval-probe-dir").exists(), answer=final[:300])
+    """A target approval is reported at once; its real ending is reported; it can be answered from the manager."""
+    for tag, (how, outcomes, words, probe_stays) in APPROVAL_ENDINGS.items():
+        probe = HOME / f"{tag.lower()}-probe-dir"
+        async with Client("default") as mgr, Client("analyst") as viewer:
+            sid = await manager_session(mgr)
+            probe.mkdir(exist_ok=True)
+            ack = await start_task(ctx, mgr, sid, tag, f"approval {how}")
+            task_id, asid = ack["task_id"], ack["session_id"]
+            await viewer.rpc("session.resume", session_id=asid, omit_messages=True)
+            notice = await until(lambda: manager_got(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval"),
+                                 APPROVAL_TIMEOUT, "approval notice")
+            notice_at = time.time()
+            acted = None
+            if how in ("approve", "deny"):
+                request = await until(lambda: next((f for f in viewer.frames if f.get("type") == "approval.request"
+                                                    and f.get("session_id") == asid), None), 10, "target prompt")
+                acted = await viewer.rpc("approval.respond", session_id=asid,
+                                         execution_generation=request["payload"]["execution_generation"],
+                                         prompt_id=request["payload"]["prompt_id"],
+                                         choice="once" if how == "approve" else "deny")
+            elif how == "interrupt":
+                request = await until(lambda: next((f for f in viewer.frames if f.get("type") == "approval.request"
+                                                    and f.get("session_id") == asid), None), 10, "target prompt")
+                acted = await viewer.rpc("session.interrupt", session_id=asid,
+                                         execution_generation=request["payload"]["execution_generation"])
+            ended = await until(lambda: manager_got(ctx["m"], f"Task {task_id} (analyst): the approval for"),
+                                APPROVAL_TIMEOUT + 60, "approval ending notice")
+            ended_at = time.time()
+            stored = await until(lambda: plugin_task(task_id).get("last_approval"), 30, "stored approval outcome")
+            check("approval", f"hermes://open/{asid}" in notice and probe.name in notice
+                  and "action=approval" in notice and (how != "expire" or ended_at - notice_at > APPROVAL_TIMEOUT - 3),
+                  f"approval then {how}: the manager got the command, task, session and link while it was answerable",
+                  notice=notice, seconds_notice_before_ending=round(ended_at - notice_at, 1))
+            check("approval", stored.get("outcome") in outcomes and words in ended
+                  and probe.exists() == probe_stays,
+                  f"approval then {how} in the analyst session: the manager is told the real ending "
+                  f"({'/'.join(outcomes)}), read from the gated command's result",
+                  target_frames=[(f.get("type"), (f.get("payload") or {}).get("result", {}).get("status")
+                                  if isinstance((f.get("payload") or {}).get("result"), dict) else None)
+                                 for f in viewer.frames if f.get("session_id") == asid
+                                 and str(f.get("type")).split(".")[0] in ("approval", "tool", "message")
+                                 and f.get("type") != "message.delta"][:30],
+                  target_action=acted, ending_notice=ended, stored_outcome=stored.get("outcome"),
+                  stored_user_summary=stored.get("user_summary"), probe_dir_exists=probe.exists())
     # Relayed: the prompt opens in the manager conversation, the answer there runs the command.
     RELAY["on"] = True
     try:
-        async with Client("default") as mgr:
-            sid = await manager_session(mgr)
-            (HOME / "relay-probe-dir").mkdir(exist_ok=True)
-            ack = await start_task(ctx, mgr, sid, "RELAY", "approval relay")
-            task_id, asid = ack["task_id"], ack["session_id"]
-            t0 = time.time()
-            await until(lambda: manager_got(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval"),
-                        APPROVAL_TIMEOUT, "relay notice")
-            notice_at = time.time()
-            card = await until(lambda: next((f for f in mgr.frames if f.get("type") == "approval.request"
-                                             and f.get("session_id") == sid), None), APPROVAL_TIMEOUT, "manager card")
-            card_at = time.time()
-            payload = card["payload"]
-            before = len(ctx["m"].main_requests())
-            respond = await mgr.rpc("approval.respond", session_id=sid,
-                                    execution_generation=payload["execution_generation"],
-                                    prompt_id=payload["prompt_id"], choice="once")
-            relayed = await until(lambda: tool_result_of(ctx["m"], "approval", before), 120, "approval tool result")
-            final = await answer_of(ctx, mgr, sid, task_id)
-            check("approval", card_at - t0 < APPROVAL_TIMEOUT and "relay-probe-dir" in str(payload.get("command"))
-                  + str(payload.get("description")),
-                  "the approval prompt itself opened in the manager conversation before the target request expired",
-                  manager_card=payload, seconds_notice=round(notice_at - t0, 1), seconds_card=round(card_at - t0, 1),
-                  analyst_session=asid, manager_session=sid)
-            check("approval", relayed.get("forwarded") is True and relayed.get("choice") == "once"
-                  and '"exit_code": 0' in final and not (HOME / "relay-probe-dir").exists(),
-                  "approve clicked in the manager conversation: the answer reached the analyst session and the "
-                  "command ran", respond=respond, relay_result=relayed, answer=final[:400],
-                  probe_dir_exists=(HOME / "relay-probe-dir").exists())
+        for choice, tag in (("once", "RELAY"), ("always", "RELAYALWAYS")):
+            probe = HOME / f"{tag.lower()}-probe-dir"
+            async with Client("default") as mgr:
+                sid = await manager_session(mgr)
+                probe.mkdir(exist_ok=True)
+                ack = await start_task(ctx, mgr, sid, tag, f"approval relay {choice}")
+                task_id, asid = ack["task_id"], ack["session_id"]
+                t0 = time.time()
+                await until(lambda: manager_got(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval"),
+                            APPROVAL_TIMEOUT, "relay notice")
+                notice_at = time.time()
+                card = await until(lambda: next((f for f in mgr.frames if f.get("type") == "approval.request"
+                                                 and f.get("session_id") == sid), None), APPROVAL_TIMEOUT,
+                                   "manager card")
+                card_at = time.time()
+                payload = card["payload"]
+                before = len(ctx["m"].main_requests())
+                respond = await mgr.rpc("approval.respond", session_id=sid,
+                                        execution_generation=payload["execution_generation"],
+                                        prompt_id=payload["prompt_id"], choice=choice)
+                relayed = await until(lambda: tool_result_of(ctx["m"], "approval", before), 120,
+                                      "approval tool result")
+                final = await answer_of(ctx, mgr, sid, task_id)
+                text = str(payload.get("command")) + str(payload.get("description"))
+                check("approval", card_at - t0 < APPROVAL_TIMEOUT and probe.name in text
+                      and "'always' permanently allows that kind of command in the analyst profile" in text
+                      and "one inert rule for this prompt in the manager profile's config" in text,
+                      f"the approval prompt itself opened in the manager conversation before the target request "
+                      f"expired, and its text states what 'always' does ({choice} run)",
+                      manager_card=payload, seconds_notice=round(notice_at - t0, 1),
+                      seconds_card=round(card_at - t0, 1), analyst_session=asid, manager_session=sid)
+                check("approval", relayed.get("forwarded") is True and relayed.get("choice") == choice
+                      and '"exit_code": 0' in final and not probe.exists(),
+                      f"{choice} clicked in the manager conversation: the answer reached the analyst session and "
+                      f"the command ran", respond=respond, relay_result=relayed, answer=final[:400],
+                      probe_dir_exists=probe.exists())
+                if choice == "always":
+                    target_rules = (yaml.safe_load((HH / "profiles/analyst/config.yaml").read_text()) or {}).get(
+                        "command_allowlist") or []
+                    manager_rules = (yaml.safe_load((HH / "config.yaml").read_text()) or {}).get(
+                        "command_allowlist") or []
+                    relay_rules = [r for r in manager_rules if "profile_task_relay" in str(r)]
+                    check("approval", len(target_rules) >= 1 and relay_rules == [
+                          f"plugin_rule:profile_task_relay:{plugin_task(task_id)['last_approval']['prompt_id']}"]
+                          and not any("profile_task_relay" in str(r) for r in target_rules),
+                          "'always' relayed: the analyst profile's command_allowlist now allows that kind of command, "
+                          "and the manager config holds exactly one inert rule keyed to that prompt",
+                          analyst_command_allowlist=target_rules, manager_command_allowlist=manager_rules)
     finally:
         RELAY["on"] = False
 
@@ -593,52 +677,162 @@ async def trial_timeout_status(ctx) -> None:
               "a second status keeps the answer and does not re-read the target", status=again)
 
 
+def notice_log(task_id: str) -> dict:
+    """The plugin's delivery record of the task's notices: delivered ones and those still kept."""
+    task = plugin_task(task_id)
+    return {"notices": task.get("notices") or [],
+            "kept": [{k: e.get(k) for k in ("kind", "attempts")} for e in task.get("outbox") or []]}
+
+
+async def call_tool(ctx, mgr: Client, sid: str, args: dict, action: str) -> dict:
+    before = len(ctx["m"].main_requests())
+    await say(mgr, sid, "CALL " + json.dumps(args))
+    return await until(lambda: tool_result_of(ctx["m"], action, before), 180, f"{action} result")
+
+
+async def trial_followup(ctx) -> None:
+    """A follow_up while the task's turn runs is refused and points to correct; after the answer it is taken."""
+    async with Client("default") as mgr:
+        sid = await manager_session(mgr)
+        ack = await start_task(ctx, mgr, sid, "HANGFU", "follow-up while running")
+        task_id, asid = ack["task_id"], ack["session_id"]
+        await until(lambda: any("SCENARIO:HANGFU" in text_of(m) for b in ctx["a"].main_requests()
+                                for m in b["messages"]), 60, "analyst turn running")
+        refused = await call_tool(ctx, mgr, sid, {"action": "follow_up", "task_id": task_id,
+                                                  "text": "SCENARIO:FUEARLY extra"}, "follow_up")
+        stored = plugin_task(task_id)
+        early_users = [r for r in analyst_db("SELECT role, coalesce(content, '') FROM messages WHERE session_id = ?",
+                                             (asid,)) if r[0] == "user" and "FUEARLY" in r[1]]
+        check("followup", "error" in refused and "action=correct" in refused["error"]
+              and len(stored.get("turns") or []) == 1 and stored.get("status") == "running" and not early_users,
+              "follow_up during a running turn is refused, points to correct, and leaves the task state as it was",
+              result=refused, task_turns=stored.get("turns"), task_status=stored.get("status"),
+              analyst_rows_with_followup=len(early_users))
+        answer = await answer_of(ctx, mgr, sid, task_id)
+        taken = await call_tool(ctx, mgr, sid, {"action": "follow_up", "task_id": task_id,
+                                                "text": "SCENARIO:FULATE extra"}, "follow_up")
+        later = plugin_task(task_id)
+        check("followup", "HANGFU-DONE" in answer and taken.get("accepted") is True
+              and taken.get("session_id") == asid and len(later.get("turns") or []) == 2,
+              "once the turn has ended, the same follow_up is taken in the same session as the task's second turn",
+              first_answer=answer[:200], result=taken, task_turns=later.get("turns"))
+
+
+async def trial_notice_retry(ctx) -> None:
+    """Approval notices refused by a closed manager conversation are kept and handed over on the next tool call."""
+    async with Client("default") as mgr:
+        snap = await mgr.rpc("session.create", source="gui", request_id=uuid.uuid4().hex)
+        sid = snap["session_id"]
+        ack = await start_task(ctx, mgr, sid, "APPROVALLATE", "refused approval notice")
+        task_id = ack["task_id"]
+        # The start result is already in a model request; that request's reply ends the manager turn.
+        await asyncio.sleep(2)
+        # What the desktop sends when the conversation is closed.
+        closed = await mgr.rpc("session.detach", session_id=sid, subscription_id=snap.get("subscription_id") or (
+            await mgr.rpc("session.resume", session_id=sid, omit_messages=True))["subscription_id"],
+                               end_reason="tui_close")
+        # Until the task's result is kept too, no event of this task is left to retry the delivery.
+        kept = await until(lambda: (lambda log: log if {e["kind"] for e in log["kept"]} >= {
+            "approval", "approval_end", "result"} else None)(notice_log(task_id)),
+            LATE_APPROVAL_DELAY + APPROVAL_TIMEOUT + 90, "approval, its ending and the result kept")
+        missed = [manager_saw(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval"),
+                  manager_saw(ctx["m"], f"Task {task_id} (analyst): the approval for")]
+        await mgr.rpc("session.resume", session_id=sid, omit_messages=True)
+        await call_tool(ctx, mgr, sid, {"action": "status"}, "status")
+        got = await until(lambda: manager_saw(ctx["m"], f"Task {task_id} (analyst): the approval for"), 120,
+                          "kept notices delivered")
+        after = await until(lambda: (lambda log: log if not log["kept"] else None)(notice_log(task_id)), 60,
+                            "outbox emptied")
+        check("retry", not any(missed) and all(not a["ok"] for e in kept["kept"] for a in e["attempts"])
+              and all(n["trigger"] == "tool_call" for n in after["notices"]) and not after["kept"]
+              and [n["kind"] for n in after["notices"]] == ["approval", "approval_end", "result"]
+              and "expired unanswered" in got
+              and manager_saw(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval"),
+              "the approval notice and its expiry, refused while the manager conversation was closed, were kept "
+              "and handed over in order at the next profile_task call",
+              session_close=closed, kept_before=kept, delivered_after=after, delivered_ending=got,
+              seen_before_reopen=[bool(x) for x in missed],
+              seen_after=bool(manager_saw(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval")))
+
+
 async def restart_gateway(ctx, how: str) -> dict:
     """Stop the isolated gateway (control socket ``force`` or SIGKILL) and start a new one."""
+    from gateway.control_socket import identify_gateway
     old = ctx["proc"]
     t0 = time.monotonic()
     if how == "kill":
-        os.kill(old.pid, signal.SIGKILL)
+        # The child we start can attach to a host gateway it did not spawn; SIGKILL the pid that serves HH.
+        host = int((identify_gateway(HH, timeout=5.0) or {}).get("pid") or 0)
+        if not host:
+            raise RuntimeError("no gateway answers on the isolated control socket")
+        os.kill(host, signal.SIGKILL)
+        deadline = time.monotonic() + 30
+        while alive(host) and time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(old.pid, signal.SIGKILL)
         old.wait(30)
+        stopped = {"how": how, "old_pid": host, "old_alive": alive(host),
+                   "stop_seconds": round(time.monotonic() - t0, 1)}
     else:
+        host = int((identify_gateway(HH, timeout=5.0) or {}).get("pid") or 0)
         stop_by_socket(HH)
         old.wait(90)
-    stopped = {"how": how, "old_pid": old.pid, "old_alive": alive(old.pid),
-               "stop_seconds": round(time.monotonic() - t0, 1)}
+        stopped = {"how": how, "old_pid": host, "old_alive": alive(host) if host else None,
+                   "stop_seconds": round(time.monotonic() - t0, 1)}
     ctx["proc"] = start_gateway()
     async with Client("default"):
         pass
-    stopped["new_pid"] = ctx["proc"].pid
+    stopped["new_pid"] = int((identify_gateway(HH, timeout=5.0) or {}).get("pid") or 0)
     return stopped
 
 
 async def trial_restart(ctx) -> None:
+    """Both restart kinds: at load the plugin finds the cut-off tasks and tells the manager conversation itself."""
     for how in ("socket", "kill"):
-        tag = f"HANG{how.upper()}"
+        hang, appr = f"HANG{how.upper()}", f"APPROVALRS{how.upper()}"
         async with Client("default") as mgr:
             sid = await manager_session(mgr)
-            ack = await start_task(ctx, mgr, sid, tag, f"restart {how}")
-            task_id = ack["task_id"]
-            await until(lambda: any(f"SCENARIO:{tag}" in text_of(m) for b in ctx["a"].main_requests()
+            waiting = (await start_task(ctx, mgr, sid, hang, f"restart {how}"))["task_id"]
+            await until(lambda: any(f"SCENARIO:{hang}" in text_of(m) for b in ctx["a"].main_requests()
                                     for m in b["messages"]), 60, "analyst turn running")
+            approving = (await start_task(ctx, mgr, sid, appr, f"restart {how} with approval"))["task_id"]
+            pending = await until(lambda: plugin_task(approving).get("pending_approval"), APPROVAL_TIMEOUT,
+                                  "approval pending")
             hang_end = time.monotonic() + HANG_SECONDS + 5
         restarted = await restart_gateway(ctx, how)
+        # No client opens the manager conversation and nothing calls the tool: the plugin acts at load.
+        told = [await until(lambda t=t: manager_got(ctx["m"], f"Task {t} (analyst): the gateway restarted"),
+                            120, "restart notice") for t in (waiting, approving)]
+        recovered = {t: plugin_task(t) for t in (waiting, approving)}
+        delivered = {t: notice_log(t) for t in (waiting, approving)}
         async with Client("default") as mgr:
-            sid = await manager_session(mgr)
-            status = await ask_status(ctx, mgr, sid, task_id)
-            row = status["tasks"][0]
-            note = row.get("note") or ""
-            check("restart", row["status"] != "running" and ("restarted" in note or "lost its connection" in note),
-                  f"gateway {how} stop while the task runs: status says the wait was lost and what happened",
-                  restart=restarted, status=status, analyst_session=ack["session_id"])
+            await mgr.rpc("session.resume", session_id=sid, omit_messages=True)
+            check("restart", all(r.get("status") == "wait_lost" and r.get("waiter") is None for r in recovered.values())
+                  and all(any(n["kind"] == "restart" and n["trigger"] == "load" for n in log["notices"])
+                          and not log["kept"] for log in delivered.values())
+                  and all(f"action=status task_id={t}" in m for t, m in zip((waiting, approving), told)),
+                  f"gateway {how} restart: at load the plugin marked both cut-off tasks and the manager conversation "
+                  f"got a notice for each, before any status call; notices refused earlier were kept and sent too",
+                  restart=restarted, after_load={t: {k: r.get(k) for k in ("status", "waiter", "error")}
+                                                 for t, r in recovered.items()},
+                  delivery=delivered, notices=told)
+            approval_after = recovered[approving]
+            check("restart", pending.get("prompt_id") and not approval_after.get("pending_approval")
+                  and not approval_after.get("settling_approval")
+                  and (approval_after.get("last_approval") or {}).get("outcome") in ("interrupted", "cancelled")
+                  and "did not run" in told[1],
+                  f"gateway {how} restart with an approval open: the stale approval is cleared at load and the "
+                  f"manager is told it ended with the restart",
+                  pending_before=pending, last_approval=approval_after.get("last_approval"),
+                  pending_after=approval_after.get("pending_approval"), notice=told[1])
             # Past the time the cut-off model call would have answered.
             await until(lambda: time.monotonic() >= hang_end, HANG_SECONDS + 60, "hang window over")
-            again = await ask_status(ctx, mgr, sid, task_id)
-            woke = manager_got(ctx["m"], f"{tag}-DONE")
+            again = await call_tool(ctx, mgr, sid, {"action": "status", "task_id": waiting}, "status")
+            woke = manager_got(ctx["m"], f"{hang}-DONE")
             check("restart", again["tasks"][0]["status"] != "running" and not woke,
                   f"after the {how} restart nothing waits silently: a later status still reports, no late answer "
-                  f"is injected",
-                  status=again, injected=woke)
+                  f"is injected", status=again, injected=woke)
 
 
 async def trial_bad_target(ctx) -> None:
@@ -653,6 +847,8 @@ async def trial_bad_target(ctx) -> None:
 
 TRIALS = {"1-2-3": trial_1_2_3, "4": trial_4, "5": trial_5, "6": trial_6, "7": trial_7, "8": trial_8,
           "9": trial_9, "limit": trial_timeout_status, "targets": trial_bad_target, "restart": trial_restart,
+          "followup": trial_followup, "retry": trial_notice_retry,
+          # Last: its 'always' relay permanently allows recursive delete in the analyst profile.
           "approval": trial_approval}
 
 
