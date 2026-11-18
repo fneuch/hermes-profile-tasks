@@ -28,7 +28,10 @@ profile served by the same Hermes gateway.
 - Gateway restart: when the plugin loads, it finds the tasks whose waiting process is gone, marks
   them (`wait_lost`, or `failed` if the target never accepted the task), closes any approval that
   was open (the command did not run), and queues one notice per task to its manager conversation.
-  It sends them once the gateway accepts plugin messages, then as above.
+  It sends them once the gateway accepts plugin messages, then as above. When several processes load
+  the plugin at once (a gateway launcher that then attaches to the running gateway, and that gateway),
+  each task is closed and noticed by one of them only: the plugin state is read and written under a
+  lock file in the plugin's data folder.
 - Wait limit: 30 minutes by default. Past it the manager gets a message: no answer yet, the work
   is not cancelled, check back with `status`.
 - Approvals in a task session: the plugin's connection to the target session sees its

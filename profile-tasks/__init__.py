@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import fcntl
 import inspect
 import json
 import logging
@@ -48,6 +49,8 @@ _REQUIRED_FIELDS = {
     "approval.respond": {"session_id", "choice"},
 }
 _STATE_LOCK = threading.Lock()
+# An approval withdrawn this close before the wait was cut ended with the gateway stop.
+STOP_GRACE_SECONDS = 5.0
 WAITING = ("starting", "running")
 REFRESHABLE = ("starting", "running", "waiting_timeout", "wait_lost")
 
@@ -82,6 +85,9 @@ def check_internals(ctx: Any = None) -> list[str]:
     runtime = need("hermes_cli.gateway_runtime", ("ensure_gateway_runtime",))
     need("hermes_cli.gateway_multiplex_served", ("recorded_served_profiles",))
     need("hermes_cli.profiles", ("get_profile_dir",))
+    state = need("hermes_cli.plugins_state", ("PluginState",))
+    if state is not None and not hasattr(getattr(state, "PluginState", None), "data_dir"):
+        missing.append("hermes_cli.plugins_state.PluginState.data_dir")
     need("hermes_constants", ("get_hermes_home",))
     need("gateway.session_context", ("bound_session_key",))
     need("tools.approval", ("request_tool_approval", "list_gateway_approvals", "withdraw_gateway_approval"))
@@ -161,13 +167,30 @@ class TaskStore:
         return self.all().get(task_id)
 
     def update(self, task_id: str, /, **fields: Any) -> dict:
-        with _STATE_LOCK:
+        return self.modify(task_id, lambda _task: fields)
+
+    def modify(self, task_id: str, change: Any) -> dict | None:
+        """Store ``change(task)``'s fields in the task, read and written under one lock; None changes nothing."""
+        with self._locked():
             tasks = dict(self._state.get(STATE_KEY, {}) or {})
             task = dict(tasks.get(task_id, {}))
+            fields = change(dict(task))
+            if fields is None:
+                return None
             task.update(fields, updated_at=time.time())
             tasks[task_id] = task
             self._state.set(STATE_KEY, tasks)
             return task
+
+    @contextlib.contextmanager
+    def _locked(self):
+        # Every process that loads the plugin (the gateway, a launcher that then attaches to it) writes this state.
+        with _STATE_LOCK:
+            path = Path(self._state.data_dir) / "tasks.lock"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a+b") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                yield
 
 
 # ---- gateway client ---------------------------------------------------------------------------
@@ -270,6 +293,21 @@ def _waiter_alive(token: str | None) -> bool:
     except (OSError, IndexError):
         return False
     return _process_token(pid) == token
+
+
+def _ended_by_stop(task: dict, last: dict) -> bool:
+    """True if the approval was withdrawn as the stopping gateway ended the turn, just before it cut the wait."""
+    if last.get("outcome") not in ("cancelled", "interrupted") or "raised_at" not in last:
+        return False
+    ended = last.get("settled_at") or last["raised_at"] + float(last.get("settled_after_s") or 0)
+    cuts = [e["queued_at"] for e in list(task.get("outbox") or []) + list(task.get("notices") or [])
+            if e.get("kind") == "wait_lost"]
+    return any(0 <= cut - ended <= STOP_GRACE_SECONDS for cut in cuts)
+
+
+def _notice(message: str, kind: str) -> dict:
+    """One outbox entry for the calling conversation."""
+    return {"id": uuid.uuid4().hex[:8], "kind": kind, "text": message, "queued_at": time.time(), "attempts": []}
 
 
 def _final_text(receipt: dict) -> tuple[bool, str]:
@@ -693,7 +731,8 @@ class ProfileTasks:
         with self._outbox_lock:
             task = self.store.get(task_id) or {}
             outbox = list(task.get("outbox") or [])
-            sent = list(task.get("notices") or [])
+            sent: list[dict] = []
+            refused: dict | None = None
             fields: dict = {}
             while outbox:
                 entry = dict(outbox[0])
@@ -704,7 +743,7 @@ class ProfileTasks:
                     ok = False
                 entry["attempts"] = list(entry["attempts"]) + [{"at": time.time(), "trigger": trigger, "ok": ok}]
                 if not ok:
-                    outbox[0] = entry
+                    refused = entry
                     logger.warning("profile-tasks: the calling conversation refused a %s notice of task %s; kept "
                                    "for the next try", entry["kind"], task_id)
                     break
@@ -713,8 +752,15 @@ class ProfileTasks:
                             | {"delivered_at": time.time(), "trigger": trigger})
                 if entry["kind"] == "result":
                     fields.update(delivered=True, delivered_by="injection")
-            self.store.update(task_id, outbox=outbox, notices=sent, **fields)
-            return not outbox
+            delivered = {e["id"] for e in sent}
+
+            # Merged into the stored outbox: another process may have queued a notice during the injections.
+            def merge(current: dict) -> dict:
+                left = [refused if refused and e["id"] == refused["id"] else e
+                        for e in current.get("outbox") or [] if e["id"] not in delivered]
+                return {"outbox": left, "notices": list(current.get("notices") or []) + sent, **fields}
+
+            return not self.store.modify(task_id, merge)["outbox"]
 
     def _drop_notices(self, task_id: str, kind: str) -> None:
         with self._outbox_lock:
@@ -740,49 +786,52 @@ class ProfileTasks:
     # gateway restart: found at load, told to each calling conversation
     def recover_after_restart(self) -> list[str]:
         """Close out tasks whose waiting process is gone; queue one notice each. Returns their ids."""
-        found = []
-        for task_id, task in self.store.all().items():
-            if not task.get("waiter") or _waiter_alive(task.get("waiter")):
-                continue
-            # A stop can cut the wait (wait_lost) or end the approval watch just before the process exits.
-            waiting = task.get("status") in WAITING or task.get("status") == "wait_lost"
-            approval = task.get("pending_approval") or task.get("settling_approval")
-            last = task.get("last_approval") or {}
-            if last.get("outcome") == "watch_lost":
-                approval = approval or last
-            if not waiting and not approval:
-                continue
-            found.append(task_id)
-            profile, session_id = task.get("profile"), task.get("session_id")
-            parts = [f"Task {task_id} ({profile}): the gateway restarted"]
-            fields: dict = {"waiter": None, "pending_approval": None, "settling_approval": None}
-            if waiting and not (session_id and task.get("admission_id")):
-                fields.update(status="failed", error="the gateway restarted before the target accepted the task")
-                parts.append(" before the target accepted it. Start it again.")
-            elif waiting:
-                fields.update(status="wait_lost", error="the gateway restarted while the task was waiting")
-                parts.append(f" while this task was waiting, so its answer will not be injected here. Check it "
-                             f"with profile_task action=status task_id={task_id}; the {profile} session "
-                             f"{session_id} still exists (hermes://open/{session_id}).")
-            else:
-                parts.append(f" after the wait limit, while the {profile} session had an approval open.")
-            if approval:
-                fields["last_approval"] = {**approval, "outcome": "interrupted", "settled_at": time.time()}
-                parts.append(f" The approval for `{approval.get('command')}` ended with the restart: the command did "
-                             f"not run.")
-            self.store.update(task_id, **fields)
-            self._queue_only(task_id, "".join(parts), "restart")
+        found = [task_id for task_id in self.store.all()
+                 if self.store.modify(task_id, lambda task, tid=task_id: self._close_cut_off(tid, task))]
         if any(task.get("outbox") for task in self.store.all().values()):
             threading.Thread(target=self._flush_when_hosted, name="profile-tasks-load", daemon=True).start()
         return found
 
+    @staticmethod
+    def _close_cut_off(task_id: str, task: dict) -> dict | None:
+        """Fields that close a task cut off by a restart, its notice queued with them; None if it needs none.
+
+        Read and written in one locked step, so of several processes loading the plugin at once only one does it.
+        """
+        if not task.get("waiter") or _waiter_alive(task.get("waiter")):
+            return None
+        # A stop can cut the wait (wait_lost) or end the approval watch just before the process exits.
+        waiting = task.get("status") in WAITING or task.get("status") == "wait_lost"
+        approval = task.get("pending_approval") or task.get("settling_approval")
+        last = task.get("last_approval") or {}
+        if last.get("outcome") == "watch_lost" or _ended_by_stop(task, last):
+            approval = approval or last
+        if not waiting and not approval:
+            return None
+        profile, session_id = task.get("profile"), task.get("session_id")
+        parts = [f"Task {task_id} ({profile}): the gateway restarted"]
+        fields: dict = {"waiter": None, "pending_approval": None, "settling_approval": None}
+        if waiting and not (session_id and task.get("admission_id")):
+            fields.update(status="failed", error="the gateway restarted before the target accepted the task")
+            parts.append(" before the target accepted it. Start it again.")
+        elif waiting:
+            fields.update(status="wait_lost", error="the gateway restarted while the task was waiting")
+            parts.append(f" while this task was waiting, so its answer will not be injected here. Check it "
+                         f"with profile_task action=status task_id={task_id}; the {profile} session "
+                         f"{session_id} still exists (hermes://open/{session_id}).")
+        else:
+            parts.append(f" after the wait limit, while the {profile} session had an approval open.")
+        if approval:
+            fields["last_approval"] = {**approval, "outcome": "interrupted", "settled_at": time.time()}
+            parts.append(f" The approval for `{approval.get('command')}` ended with the restart: the command did "
+                         f"not run.")
+        fields["outbox"] = list(task.get("outbox") or []) + [_notice("".join(parts), "restart")]
+        return fields
+
     def _queue_only(self, task_id: str, message: str, kind: str) -> None:
         with self._outbox_lock:
-            task = self.store.get(task_id) or {}
-            outbox = list(task.get("outbox") or [])
-            outbox.append({"id": uuid.uuid4().hex[:8], "kind": kind, "text": message, "queued_at": time.time(),
-                           "attempts": []})
-            self.store.update(task_id, outbox=outbox)
+            entry = _notice(message, kind)
+            self.store.modify(task_id, lambda task: {"outbox": list(task.get("outbox") or []) + [entry]})
 
     def _flush_when_hosted(self) -> None:
         deadline = time.monotonic() + LOAD_FLUSH_WAIT_SECONDS
