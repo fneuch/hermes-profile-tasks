@@ -75,12 +75,19 @@ def scenario_of(messages: list[dict]) -> tuple[str, int]:
     return "", -1
 
 
+RELAY = {"on": False}
+APPROVAL_TIMEOUT = 10
+
+
 def manager_model(record: dict):
     messages = record["body"]["messages"]
     last = messages[-1]
     if last.get("role") == "tool":
         return Text("MANAGER-ACK")
     text = text_of(last)
+    if RELAY["on"] and "action=approval task_id=" in text:
+        task_id = text.split("action=approval task_id=", 1)[1].split()[0].rstrip(":.,")
+        return ToolCall("profile_task", {"action": "approval", "task_id": task_id})
     if "CALL " in text:
         return ToolCall("profile_task", json.loads(text.split("CALL ", 1)[1].strip()))
     return Text("MANAGER-WOKE")
@@ -120,10 +127,10 @@ def analyst_model(record: dict):
         if after_user and "CORRECTION-" in text_of(messages[-1]):
             return Text("LATE-SECOND-TURN handled the correction", reasoning=reasoning)
         return Text("LATE-FINAL " + "x" * 120, reasoning=reasoning, chunk_chars=4, delay_per_chunk=0.25)
-    if tag == "APPROVAL":
+    if tag in ("APPROVAL", "RELAY"):
         if not tool_results:
-            return ToolCall("terminal", {"command": f"rm -rf {HOME}/approval-probe-dir"})
-        return Text(f"APPROVAL-RESULT {text_of(tool_results[-1])[:400]}", reasoning=reasoning)
+            return ToolCall("terminal", {"command": f"rm -rf {HOME}/{tag.lower()}-probe-dir"})
+        return Text(f"{tag}-RESULT {text_of(tool_results[-1])[:400]}", reasoning=reasoning)
     if tag == "SLOW":
         time.sleep(WAIT_LIMIT + 15)
         return Text("SLOW-DONE", reasoning=reasoning)
@@ -158,7 +165,7 @@ def write_home(manager_url: str, analyst_url: str) -> None:
                                       "settings": {"wait_timeout_seconds": WAIT_LIMIT}}},
     })
     analyst = dict(common, model=model(analyst_url), display={"show_reasoning": True},
-                   approvals={"mode": "smart", "timeout": 10},
+                   approvals={"mode": "smart", "timeout": APPROVAL_TIMEOUT},
                    mcp_servers={"atlassian": {"command": sys.executable, "args": [str(FIXTURE_MCP)],
                                               "env": {"PARITY_MCP_CANARY": CANARY, "PYTHONPATH": str(AGENT)},
                                               "connect_timeout": 60, "timeout": 60}})
@@ -387,6 +394,79 @@ async def trial_5(ctx) -> None:
               aux_requests_to_analyst_model=len(ctx["a"].aux_requests()))
 
 
+async def answer_of(ctx, mgr: Client, sid: str, task_id: str) -> str:
+    """The task's final answer: injected if it came within the wait limit, else read through status."""
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        injected = manager_got(ctx["m"], f"Answer from analyst for task {task_id}")
+        if injected:
+            return injected
+        row = (await ask_status(ctx, mgr, sid, task_id))["tasks"][0]
+        if row.get("answer"):
+            return row["answer"]
+        await asyncio.sleep(5)
+    raise TimeoutError(f"answer of {task_id}")
+
+
+async def trial_approval(ctx) -> None:
+    """Item 4: a target approval is reported at once, expires visibly, and can be answered from the manager."""
+    # Unanswered: the notice arrives before expiry, then the expiry outcome.
+    async with Client("default") as mgr:
+        sid = await manager_session(mgr)
+        (HOME / "approval-probe-dir").mkdir(exist_ok=True)
+        ack = await start_task(ctx, mgr, sid, "APPROVAL", "approval expiry")
+        task_id, asid = ack["task_id"], ack["session_id"]
+        notice = await until(lambda: manager_got(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval"),
+                             APPROVAL_TIMEOUT, "approval notice")
+        notice_at = time.time()
+        expired = await until(lambda: manager_got(ctx["m"], f"Task {task_id} (analyst): the approval for"),
+                              APPROVAL_TIMEOUT + 60, "expiry notice")
+        expired_at = time.time()
+        final = await answer_of(ctx, mgr, sid, task_id)
+        check("approval", f"hermes://open/{asid}" in notice and "approval-probe-dir" in notice
+              and "action=approval" in notice and expired_at - notice_at > APPROVAL_TIMEOUT - 3,
+              "unanswered approval: the manager got the command, task, session and link while it was answerable",
+              notice=notice, seconds_notice_before_expiry=round(expired_at - notice_at, 1))
+        check("approval", "expired unanswered" in expired and "did not run" in expired
+              and (HOME / "approval-probe-dir").exists(),
+              "unanswered approval: the manager got the expiry outcome, and the command did not run",
+              expiry_notice=expired, probe_dir_exists=(HOME / "approval-probe-dir").exists(), answer=final[:300])
+    # Relayed: the prompt opens in the manager conversation, the answer there runs the command.
+    RELAY["on"] = True
+    try:
+        async with Client("default") as mgr:
+            sid = await manager_session(mgr)
+            (HOME / "relay-probe-dir").mkdir(exist_ok=True)
+            ack = await start_task(ctx, mgr, sid, "RELAY", "approval relay")
+            task_id, asid = ack["task_id"], ack["session_id"]
+            t0 = time.time()
+            await until(lambda: manager_got(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval"),
+                        APPROVAL_TIMEOUT, "relay notice")
+            notice_at = time.time()
+            card = await until(lambda: next((f for f in mgr.frames if f.get("type") == "approval.request"
+                                             and f.get("session_id") == sid), None), APPROVAL_TIMEOUT, "manager card")
+            card_at = time.time()
+            payload = card["payload"]
+            before = len(ctx["m"].main_requests())
+            respond = await mgr.rpc("approval.respond", session_id=sid,
+                                    execution_generation=payload["execution_generation"],
+                                    prompt_id=payload["prompt_id"], choice="once")
+            relayed = await until(lambda: tool_result_of(ctx["m"], "approval", before), 120, "approval tool result")
+            final = await answer_of(ctx, mgr, sid, task_id)
+            check("approval", card_at - t0 < APPROVAL_TIMEOUT and "relay-probe-dir" in str(payload.get("command"))
+                  + str(payload.get("description")),
+                  "the approval prompt itself opened in the manager conversation before the target request expired",
+                  manager_card=payload, seconds_notice=round(notice_at - t0, 1), seconds_card=round(card_at - t0, 1),
+                  analyst_session=asid, manager_session=sid)
+            check("approval", relayed.get("forwarded") is True and relayed.get("choice") == "once"
+                  and '"exit_code": 0' in final and not (HOME / "relay-probe-dir").exists(),
+                  "approve clicked in the manager conversation: the answer reached the analyst session and the "
+                  "command ran", respond=respond, relay_result=relayed, answer=final[:400],
+                  probe_dir_exists=(HOME / "relay-probe-dir").exists())
+    finally:
+        RELAY["on"] = False
+
+
 async def trial_6(ctx) -> None:
     async with Client("default") as mgr:
         sid = await manager_session(mgr)
@@ -572,7 +652,8 @@ async def trial_bad_target(ctx) -> None:
 
 
 TRIALS = {"1-2-3": trial_1_2_3, "4": trial_4, "5": trial_5, "6": trial_6, "7": trial_7, "8": trial_8,
-          "9": trial_9, "limit": trial_timeout_status, "targets": trial_bad_target, "restart": trial_restart}
+          "9": trial_9, "limit": trial_timeout_status, "targets": trial_bad_target, "restart": trial_restart,
+          "approval": trial_approval}
 
 
 async def main(selected: list[str]) -> int:

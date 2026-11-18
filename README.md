@@ -19,6 +19,18 @@ profile served by the same Hermes gateway.
   resends or discards the turn in the desktop).
 - Wait limit: 30 minutes by default. Past it the manager gets a message: no answer yet, the work
   is not cancelled, check back with `status`.
+- Approvals in a task session: the plugin's connection to the target session sees its
+  `approval.request` at once and injects a notice into the manager conversation (command, task,
+  session, `hermes://open/<session>` link, expiry time from the target profile's
+  `approvals.timeout`). If the request expires unanswered, a second notice says so and that the
+  command did not run. `approval` (action) shows the approve/deny prompt in the manager
+  conversation itself; the choice made there (`once`, `session`, `always`, `deny`) is sent to the
+  target session with `approval.respond`, so the command runs there. Limits: the prompt opens only
+  when the manager turn calls `approval` (a plugin cannot open an approval prompt in a conversation
+  with no running turn); its card title is the generic plugin rule, the target command is in its
+  description; it uses the manager profile's approval timeout, and if the manager's approvals are
+  bypassed (yolo or mode off) nothing is passed on and the target request stays pending.
+  After the wait limit the plugin keeps watching the target turn (up to 24 h) only to relay approvals.
 - Targets: every profile the gateway serves (`gateway_state.json` `served_profiles`) except the caller.
 - The target runs with its own config, MCP servers and tokens. The manager only gets text back.
 - At load time the plugin checks the Hermes internals it uses. If an update removed one, it logs

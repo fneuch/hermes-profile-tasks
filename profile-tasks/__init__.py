@@ -9,6 +9,7 @@ injected once into the calling conversation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import inspect
 import logging
@@ -26,13 +27,18 @@ TOOLSET = "profile_tasks"
 STATE_KEY = "tasks"
 DEFAULT_WAIT_SECONDS = 1800
 ACK_TIMEOUT_SECONDS = 120
-RPC_METHODS = ("session.create", "session.resume", "prompt.submit", "prompt.receipt", "session.steer")
+# After the wait limit the waiter keeps watching the target turn this long, only to relay approvals.
+APPROVAL_WATCH_SECONDS = 24 * 3600
+RELAY_RULE = "profile_task_relay"
+RPC_METHODS = ("session.create", "session.resume", "prompt.submit", "prompt.receipt", "session.steer",
+               "approval.respond")
 _REQUIRED_FIELDS = {
     "session.create": {"source", "request_id", "title"},
     "session.resume": {"session_id"},
     "prompt.submit": {"session_id", "text", "submission_id"},
     "prompt.receipt": {"session_id", "admission_id", "include_result"},
     "session.steer": {"session_id", "execution_generation", "text"},
+    "approval.respond": {"session_id", "choice"},
 }
 _STATE_LOCK = threading.Lock()
 WAITING = ("starting", "running")
@@ -66,6 +72,8 @@ def check_internals() -> list[str]:
     need("hermes_cli.profiles", ("get_profile_dir",))
     need("hermes_constants", ("get_hermes_home",))
     need("gateway.session_context", ("bound_session_key",))
+    need("tools.approval", ("request_tool_approval", "list_gateway_approvals", "withdraw_gateway_approval"))
+    need("tools.approval_context", ("get_current_session_key",))
     need("websockets.asyncio.client", ("connect",))
     if client is not None and hasattr(client, "_session_ticket"):
         params = list(inspect.signature(client._session_ticket).parameters)
@@ -126,8 +134,9 @@ class TaskStore:
 class _Connection:
     """One websocket connection to a profile's gateway, opened with a ticket bound to that profile."""
 
-    def __init__(self, home: Path) -> None:
+    def __init__(self, home: Path, on_frame: Any = None) -> None:
         self.home = home
+        self.on_frame = on_frame
         self._stack = None
         self.client = None
 
@@ -183,6 +192,11 @@ class _Connection:
             if isinstance(event, Exception):
                 raise event
             frame = event.get("params") or {}
+            if self.on_frame is not None and str(frame.get("type", "")).startswith("approval."):
+                try:
+                    self.on_frame(frame)
+                except Exception:  # noqa: BLE001 - a relay failure must not end the wait
+                    logger.warning("profile-tasks: approval frame handling failed", exc_info=True)
             if frame.get("type") == "message.complete" and (frame.get("payload") or {}).get("admission_id") == admission_id:
                 return
 
@@ -232,6 +246,9 @@ class ProfileTasks:
         self.ctx = ctx
         self.missing = missing
         self.store = TaskStore(ctx.state)
+        # prompt_id -> {"manager_key", "rule", "choice"} while a relayed card is open in the manager turn.
+        self._relays: dict[str, dict] = {}
+        self._relay_lock = threading.Lock()
 
     # settings
     def _wait_seconds(self) -> float:
@@ -281,7 +298,9 @@ class ProfileTasks:
                 return tool_result(self.correct(args.get("task_id") or "", args.get("text") or ""))
             if action == "status":
                 return tool_result(self.status(args.get("task_id")))
-            return tool_error("action must be one of: start, follow_up, correct, status")
+            if action == "approval":
+                return tool_result(self.approval(args.get("task_id") or ""))
+            return tool_error("action must be one of: start, follow_up, correct, status, approval")
         except ValueError as exc:
             return tool_error(str(exc))
 
@@ -356,7 +375,8 @@ class ProfileTasks:
     async def _send_and_wait(self, task_id: str, text: str, create: bool, accepted: dict,
                              ready: threading.Event) -> None:
         task = self.store.get(task_id)
-        async with _Connection(self._home(task["profile"])) as conn:
+        async with _Connection(self._home(task["profile"]),
+                               on_frame=lambda frame: self._on_target_frame(task_id, frame)) as conn:
             if create:
                 snapshot = await conn.rpc("session.create", source="gui", request_id=task_id, title=task["title"])
                 session_id = snapshot["session_id"]
@@ -383,6 +403,9 @@ class ProfileTasks:
                     f"Task {task_id} ({task['profile']}): no answer within {minutes} minutes. The work is not "
                     f"cancelled. Check back later with profile_task action=status task_id={task_id}."),
                     status="waiting_timeout")
+                # Keep relaying approvals until the turn ends; status reads the answer itself.
+                with contextlib.suppress(TimeoutError):
+                    await conn.wait_terminal(session_id, admission_id, time.monotonic() + APPROVAL_WATCH_SECONDS)
                 return
         ok, body = _final_text(final)
         if ok:
@@ -392,6 +415,160 @@ class ProfileTasks:
             message = (f"Task {task_id} ({task['profile']}) did not complete: {body}\n"
                        f"The {task['profile']} session {session_id} still exists.")
             self._deliver(task_id, message, status="failed", error=body)
+
+    # approvals raised in a target session
+    def _on_target_frame(self, task_id: str, frame: dict) -> None:
+        task = self.store.get(task_id) or {}
+        if frame.get("session_id") not in (None, task.get("session_id")):
+            return
+        payload = frame.get("payload") or {}
+        if frame.get("type") == "approval.request" and payload.get("prompt_id"):
+            self._approval_raised(task_id, payload)
+        elif frame.get("type") == "approval.settled" and payload.get("prompt_id"):
+            self._approval_settled(task_id, payload)
+
+    def _approval_raised(self, task_id: str, payload: dict) -> None:
+        task = self.store.get(task_id) or {}
+        profile, session_id = task.get("profile"), task.get("session_id")
+        timeout_s = float(payload.get("timeout_s") or 0)
+        raised = time.time()
+        pending = {"prompt_id": payload["prompt_id"], "execution_generation": payload.get("execution_generation"),
+                   "command": payload.get("command") or "", "description": payload.get("description") or "",
+                   "choices": list(payload.get("choices") or ["once", "deny"]), "timeout_s": timeout_s,
+                   "raised_at": raised, "expires_at": raised + timeout_s}
+        self.store.update(task_id, pending_approval=pending)
+        expires = time.strftime("%H:%M:%S", time.localtime(pending["expires_at"]))
+        self._inject(task_id, (
+            f"Task {task_id} ({profile}) is waiting for an approval in session {session_id} "
+            f"(hermes://open/{session_id}). It wants to run: {pending['command']} ({pending['description']}). "
+            f"The request expires in {round(timeout_s)} s, at {expires}; unanswered, the command does not run. "
+            f"To answer it here, call profile_task action=approval task_id={task_id}: the approve/deny prompt "
+            f"opens in this conversation and the answer goes to the {profile} session. It can also be answered "
+            f"in the {profile} session itself."))
+
+    def _approval_settled(self, task_id: str, payload: dict) -> None:
+        task = self.store.get(task_id) or {}
+        pending = task.get("pending_approval") or {}
+        prompt_id = payload["prompt_id"]
+        if pending.get("prompt_id") != prompt_id:
+            return
+        elapsed = time.time() - pending["raised_at"]
+        expired = elapsed >= pending["timeout_s"] - 1
+        with self._relay_lock:
+            relay = self._relays.get(prompt_id)
+        self.store.update(task_id, pending_approval=None,
+                          last_approval={**pending, "settled_after_s": round(elapsed, 1),
+                                         "outcome": "relayed" if relay and relay.get("forwarded")
+                                         else ("expired" if expired else "answered_in_target")})
+        if relay is not None:
+            if not relay.get("forwarded"):
+                self._withdraw_manager_card(relay, "the request in the target session ended")
+            return
+        if expired:
+            self._inject(task_id, (
+                f"Task {task_id} ({task.get('profile')}): the approval for `{pending['command']}` expired "
+                f"unanswered after {round(elapsed)} s (the {task.get('profile')} profile's approvals.timeout is "
+                f"{round(pending['timeout_s'])} s). The command did not run; the {task.get('profile')} session "
+                f"continues without it (hermes://open/{task.get('session_id')})."))
+
+    @staticmethod
+    def _withdraw_manager_card(relay: dict, cause: str) -> None:
+        from tools.approval import list_gateway_approvals, withdraw_gateway_approval
+        for entry in list_gateway_approvals(relay["manager_key"]):
+            if entry.get("pattern_key") == relay["rule"] and entry.get("request_id"):
+                withdraw_gateway_approval(relay["manager_key"], entry["request_id"], cause)
+
+    def on_approval_response(self, **kw: Any) -> None:
+        """post_approval_response hook: records the choice made on a relayed card."""
+        key = str(kw.get("pattern_key") or "")
+        prefix = f"plugin_rule:{RELAY_RULE}:"
+        if key.startswith(prefix):
+            with self._relay_lock:
+                relay = self._relays.get(key[len(prefix):])
+                if relay is not None:
+                    relay["choice"] = kw.get("choice")
+
+    def approval(self, task_id: str) -> dict:
+        task = self.store.get(task_id)
+        if task is None:
+            raise ValueError(f"unknown task {task_id}")
+        pending = task.get("pending_approval")
+        if not pending:
+            last = task.get("last_approval")
+            raise ValueError(f"task {task_id} has no pending approval"
+                             + (f" (the last one ended: {last.get('outcome')})" if last else ""))
+        if time.time() >= pending["expires_at"]:
+            raise ValueError(f"the approval of task {task_id} has expired")
+        from tools.approval import request_tool_approval
+        from tools.approval_context import get_current_session_key
+        profile, prompt_id = task["profile"], pending["prompt_id"]
+        rule_key = f"{RELAY_RULE}:{prompt_id}"
+        relay = {"manager_key": get_current_session_key(), "rule": f"plugin_rule:{rule_key}", "choice": None}
+        with self._relay_lock:
+            self._relays[prompt_id] = relay
+        expires = time.strftime("%H:%M:%S", time.localtime(pending["expires_at"]))
+        reason = (f"the {profile} task {task_id} asks to run: {pending['command']} ({pending['description']}). "
+                  f"Your answer is passed to the {profile} session {task['session_id']}, where the request "
+                  f"expires at {expires}")
+        try:
+            result = request_tool_approval(TOOL_NAME, reason, rule_key=rule_key)
+            choice = relay["choice"]
+            if choice not in ("once", "session", "always", "deny"):
+                note = ("No answer was given here" if choice in ("timeout", "cancelled") else
+                        "This conversation's approvals are bypassed (yolo or approvals.mode off), so nobody "
+                        "answered and nothing was passed on")
+                still = (self.store.get(task_id) or {}).get("pending_approval")
+                return {"task_id": task_id, "forwarded": False, "manager_choice": choice,
+                        "approved_here": bool(result.get("approved")),
+                        "note": f"{note}. The request in the {profile} session is "
+                                + ("still pending until " + expires if still else "no longer pending") + "."}
+            if choice != "deny" and choice not in pending["choices"]:
+                choice = "once"
+            relay["forwarded"] = True
+            answer = self._run_async(self._respond(task, pending, choice))
+        finally:
+            with self._relay_lock:
+                self._relays.pop(prompt_id, None)
+        return {"task_id": task_id, "forwarded": True, "choice": choice, "target_answer": answer,
+                "note": (f"Your {choice} was passed to the {profile} session; its final answer will arrive here."
+                         if answer.get("ok") else f"The {profile} session did not take the answer: {answer}")}
+
+    async def _respond(self, task: dict, pending: dict, choice: str) -> dict:
+        async with _Connection(self._home(task["profile"])) as conn:
+            await conn.rpc("session.resume", session_id=task["session_id"], omit_messages=True)
+            try:
+                result = await conn.rpc("approval.respond", session_id=task["session_id"],
+                                        execution_generation=pending["execution_generation"],
+                                        prompt_id=pending["prompt_id"], choice=choice)
+            except Exception as exc:  # noqa: BLE001 - returned to the manager as the outcome
+                return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+        return {"ok": True, "result": result}
+
+    @staticmethod
+    def _run_async(coro: Any) -> Any:
+        box: dict = {}
+
+        def run() -> None:
+            try:
+                box["value"] = asyncio.run(coro)
+            except Exception as exc:  # noqa: BLE001
+                box["value"] = {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+
+        thread = threading.Thread(target=contextvars.copy_context().run, args=(run,), daemon=True)
+        thread.start()
+        thread.join(ACK_TIMEOUT_SECONDS)
+        return box.get("value", {"ok": False, "error": "timed out"})
+
+    def _inject(self, task_id: str, message: str) -> bool:
+        task = self.store.get(task_id) or {}
+        try:
+            injected = bool(self.ctx.inject_message(message, session_key=task.get("caller_session_key")))
+        except Exception:  # noqa: BLE001
+            logger.warning("profile-tasks: injection for task %s raised", task_id, exc_info=True)
+            injected = False
+        if not injected:
+            logger.warning("profile-tasks: the calling conversation refused a notice of task %s", task_id)
+        return injected
 
     def _deliver(self, task_id: str, message: str, *, status: str, **fields: Any) -> None:
         task = self.store.get(task_id) or {}
@@ -459,6 +636,9 @@ class ProfileTasks:
         for tid, t in tasks.items():
             row = {k: t.get(k) for k in keep}
             row["link"] = f"hermes://open/{t['session_id']}" if t.get("session_id") else None
+            if t.get("pending_approval"):
+                row["pending_approval"] = {k: t["pending_approval"].get(k) for k in
+                                           ("command", "description", "expires_at")}
             if task_id and t.get("last_answer") and "answer" not in extra.get(tid, {}):
                 row["answer"] = t["last_answer"]
             rows.append(row | extra.get(tid, {}))
@@ -533,16 +713,19 @@ SCHEMA = {
         "in this conversation as a new message, so end your turn after starting. action=follow_up sends a "
         "new message in the same task session. action=correct steers the turn that is running now. "
         "action=status lists tasks and their state; for a task nobody waits on any more (past the wait limit, "
-        "or a gateway restart) it reads the target turn and returns the late answer or what happened."
+        "or a gateway restart) it reads the target turn and returns the late answer or what happened. "
+        "When a task session asks for an approval, a notice arrives here; action=approval shows that "
+        "approve/deny prompt in this conversation and passes the answer to the task session."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["start", "follow_up", "correct", "status"]},
+            "action": {"type": "string", "enum": ["start", "follow_up", "correct", "status", "approval"]},
             "profile": {"type": "string", "description": "Target profile for action=start."},
             "text": {"type": "string", "description": "Task, follow-up or correction text."},
             "title": {"type": "string", "description": "Short title for the task session (action=start)."},
-            "task_id": {"type": "string", "description": "Task id for follow_up, correct, or one task's status."},
+            "task_id": {"type": "string",
+                        "description": "Task id for follow_up, correct, approval, or one task's status."},
         },
         "required": ["action"],
     },
@@ -557,3 +740,4 @@ def register(ctx: Any) -> None:
     plugin = ProfileTasks(ctx, missing)
     ctx.register_tool(name=TOOL_NAME, toolset=TOOLSET, schema=SCHEMA, handler=plugin.handle,
                       description=SCHEMA["description"], emoji="📨")
+    ctx.register_hook("post_approval_response", plugin.on_approval_response)

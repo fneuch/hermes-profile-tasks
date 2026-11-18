@@ -27,9 +27,13 @@ class FakeCtx:
 
     def __init__(self):
         self.tools = []
+        self.hooks = []
 
     def register_tool(self, **kw):
         self.tools.append(kw)
+
+    def register_hook(self, name, callback):
+        self.hooks.append(name)
 
     def get_config(self, key, default=None):
         return default
