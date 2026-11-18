@@ -39,7 +39,7 @@ APPROVAL_OUTCOMES = ("denied", "timeout", "cancelled", "notify_failed", "blocked
 # Target frames the waiter hands to the plugin: approvals, the tool result that shows how one ended, turn ends.
 WATCHED_FRAMES = ("approval.request", "approval.settled", "tool.complete", "message.complete")
 RPC_METHODS = ("session.create", "session.resume", "prompt.submit", "prompt.receipt", "session.steer",
-               "approval.respond")
+               "approval.respond", "session.info")
 _REQUIRED_FIELDS = {
     "session.create": {"source", "request_id", "title"},
     "session.resume": {"session_id"},
@@ -47,6 +47,7 @@ _REQUIRED_FIELDS = {
     "prompt.receipt": {"session_id", "admission_id", "include_result"},
     "session.steer": {"session_id", "execution_generation", "text"},
     "approval.respond": {"session_id", "choice"},
+    "session.info": {"session_id"},
 }
 _STATE_LOCK = threading.Lock()
 # An approval withdrawn this close before the wait was cut ended with the gateway stop.
@@ -314,6 +315,28 @@ def _notice(message: str, kind: str) -> dict:
     return {"id": uuid.uuid4().hex[:8], "kind": kind, "text": message, "queued_at": time.time(), "attempts": []}
 
 
+def _reauth_server(payload: dict) -> str | None:
+    """The MCP server a tool.complete result names as needing re-authentication, or None."""
+    result = payload.get("result")
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            return None
+    if isinstance(result, dict) and result.get("needs_reauth") is True and result.get("server"):
+        return str(result["server"])
+    return None
+
+
+def _mcp_auth_problem(row: dict) -> str | None:
+    """Why a ``session.info`` ``mcp_servers`` row may need a new sign-in, or None (a parked server simply has no tools)."""
+    if row.get("needs_auth"):
+        return "its sign-in was rejected"
+    if row.get("transport") != "stdio" and row.get("status") == "failed":
+        return "it failed to connect, an expired sign-in being a common cause"
+    return None
+
+
 def _final_text(receipt: dict) -> tuple[bool, str]:
     """(succeeded, text) from a terminal receipt."""
     result = receipt.get("result") or {}
@@ -516,9 +539,12 @@ class ProfileTasks:
             self.store.update(task_id, status="running", admission_id=admission_id, turns=turns,
                               waiter=_process_token(os.getpid()))
             ready.set()
+            await self._check_mcp_auth(conn, task_id)
             deadline = time.monotonic() + self._wait_seconds()
             try:
                 final = await conn.wait_terminal(session_id, admission_id, deadline)
+                # Servers that failed during the turn, before its answer is delivered.
+                await self._check_mcp_auth(conn, task_id)
             except TimeoutError:
                 minutes = round(self._wait_seconds() / 60, 1)
                 self._deliver(task_id, (
@@ -545,6 +571,8 @@ class ProfileTasks:
             return
         payload = frame.get("payload") or {}
         kind = frame.get("type")
+        if kind == "tool.complete" and (server := _reauth_server(payload)):
+            self._mcp_auth_notice(task_id, server, "a tool call was refused: the server requires re-authentication")
         if kind == "approval.request" and payload.get("prompt_id"):
             self._approval_raised(task_id, payload)
         elif kind == "approval.settled" and payload.get("prompt_id"):
@@ -619,6 +647,41 @@ class ProfileTasks:
         }.get(name, f"ended without running the command ({summary or name})")
         self._notify(task_id, (f"Task {task_id} ({profile}): the approval for `{approval.get('command')}` {what}. "
                                f"Session {session_id} (hermes://open/{session_id})."), "approval_end")
+
+    # MCP servers of the target profile that need a new sign-in
+    async def _check_mcp_auth(self, conn: _Connection, task_id: str) -> None:
+        """Read the target profile's MCP server states; notice each server that may need re-authentication.
+
+        ``session.info`` carries them (``get_mcp_status`` in the session's profile); ``mcp.servers.status``
+        is not served on this connection.
+        """
+        task = self.store.get(task_id) or {}
+        try:
+            info = await conn.rpc("session.info", session_id=task.get("session_id"))
+        except Exception:  # noqa: BLE001 - the check must not end the task
+            logger.warning("profile-tasks: MCP status of %s could not be read", task.get("profile"), exc_info=True)
+            return
+        for row in (info or {}).get("mcp_servers") or []:
+            why = _mcp_auth_problem(row)
+            if why and row.get("name"):
+                self._mcp_auth_notice(task_id, str(row["name"]), why)
+
+    def _mcp_auth_notice(self, task_id: str, server: str, why: str) -> None:
+        """One notice per server and task: which profile, which server, and the command that signs in again."""
+
+        def mark(task: dict) -> dict | None:
+            seen = list(task.get("mcp_auth_noticed") or [])
+            return None if server in seen else {"mcp_auth_noticed": seen + [server]}
+
+        with self._outbox_lock:
+            first = self.store.modify(task_id, mark) is not None
+        if not first:
+            return
+        profile = (self.store.get(task_id) or {}).get("profile")
+        self._notify(task_id, (
+            f"Task {task_id} ({profile}): the MCP server '{server}' of the {profile} profile needs "
+            f"re-authentication: {why}. Its tools may be unavailable to this task. To fix it, run: "
+            f"hermes -p {profile} mcp login {server}"), "mcp_auth")
 
     @staticmethod
     def _withdraw_manager_card(relay: dict, cause: str) -> None:

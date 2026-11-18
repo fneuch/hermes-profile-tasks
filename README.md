@@ -53,6 +53,16 @@ profile served by the same Hermes gateway.
   open, the card is withdrawn and the manager is told the real ending; an answer that reaches the
   plugin after that ending is not recorded as pending nor sent to the target session.
   After the wait limit the plugin keeps watching the target turn (up to 24 h) only to relay approvals.
+- MCP servers needing a new sign-in: at the start and at the end of every turn of a task, the plugin
+  reads the target session's MCP server states (`session.info`, `mcp_servers`). A server whose
+  sign-in was rejected (`needs_auth`), or a remote (non-stdio) server that failed to connect, gets a
+  notice in the manager conversation: task, profile, server, and the command that fixes it
+  (`hermes -p <profile> mcp login <server>`). A target tool result carrying `needs_reauth: true`
+  (`tool.complete`) gets the same notice. One notice per server per task; it goes through the
+  notice queue above. A server parked by Hermes after repeated auth failures shows no tools but no
+  failed status, so it is only noticed through a tool result. Limit: this Hermes reports a 401 on
+  a tool call as a generic `MCPError` without `needs_reauth`, so a server that connected and then
+  loses its sign-in mid-turn is noticed only at the next state read if it then fails to connect.
 - Targets: every profile the gateway serves (`gateway_state.json` `served_profiles`) except the caller.
 - The target runs with its own config, MCP servers and tokens. The manager only gets text back.
 - At load time the plugin checks the Hermes internals it uses, including the plugin context's
@@ -89,12 +99,17 @@ Both run against an isolated Hermes home under `~/.cache/profile-tasks-e2e/<time
 only read (code and interpreter).
 
 - `PT_SCRIPT=tests/test_load_check.py e2e/run.sh`: load-time check, with all internals and with one removed.
+- `PT_SCRIPT=tests/test_mcp_reauth.py e2e/run.sh`: the `needs_reauth` tool-result notice (one per
+  server and task, kept when the manager conversation refuses it, approvals unaffected).
 - `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets restart followup
-  retry approval`; `approval` runs last because its relayed `always` permanently allows recursive
+  retry mcp_auth approval`; `approval` runs last because its relayed `always` permanently allows recursive
   delete in the isolated analyst profile). Evidence is written to `e2e/evidence/run-<timestamp>.json`. The analyst profile gets
   a fixture MCP server named `atlassian` (from the Hermes test fixtures) whose answer carries a
   per-run token set only in the analyst config. The default (manager) profile gets MCP servers
-  like the live one: an enabled fixture server named `notion` and a disabled `atlassian` entry.
+  like the live one: an enabled fixture server named `notion` and a disabled `atlassian` entry. The
+  implementer profile gets two remote (HTTP) MCP servers that need a new sign-in: `jira` answers
+  401 to every request, `linear` (the Hermes HTTP fixture) connects but answers 401 to every tool
+  call; trial `mcp_auth` checks the notices they produce.
 
 `e2e/run.sh` stops the isolated gateway on every exit (end, failure, Ctrl-C, TERM) through that
 home's own control socket (`e2e/stop_gateway.py HERMES_HOME`, which refuses the real `~/.hermes`).

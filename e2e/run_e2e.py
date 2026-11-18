@@ -17,8 +17,10 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import yaml
@@ -43,6 +45,10 @@ CANARY = "ANALYST-ONLY-" + uuid.uuid4().hex[:10]
 MANAGER_CANARY = "MANAGER-OWN-" + uuid.uuid4().hex[:10]
 MANAGER_MCP_TOOL = "mcp__notion__parity_canary"
 EVIDENCE: dict = {"base": str(HOME.parent), "canary": CANARY, "checks": []}
+HTTP_FIXTURE_MCP = AGENT / "tests/e2e/core/mcp_plugins/mcp_fixture_server.py"
+# Implementer MCP servers that need a new sign-in: one refuses every request, one refuses tool calls only.
+LOGIN_SERVER, CALL_SERVER = "jira", "linear"
+REAUTH_TOOL = f"mcp__{CALL_SERVER}__ro_probe"
 WAIT_LIMIT = 25
 HANG_SECONDS = 45
 
@@ -137,6 +143,10 @@ def analyst_model(record: dict):
         if not tool_results:
             return ToolCall("terminal", {"command": f"rm -rf {HOME}/{tag.lower()}-probe-dir"})
         return Text(f"{tag}-RESULT {text_of(tool_results[-1])[:400]}", reasoning=reasoning)
+    if tag.startswith("REAUTH"):
+        if not tool_results:
+            return ToolCall(REAUTH_TOOL, {"nonce": tag.lower()})
+        return Text(f"{tag}-RESULT {text_of(tool_results[-1])[:300]}", reasoning=reasoning)
     if tag == "SLOW":
         time.sleep(WAIT_LIMIT + 15)
         return Text("SLOW-DONE", reasoning=reasoning)
@@ -152,7 +162,7 @@ def analyst_model(record: dict):
 # ---- isolated home ------------------------------------------------------------------------------
 
 
-def write_home(manager_url: str, analyst_url: str) -> None:
+def write_home(manager_url: str, analyst_url: str, remote: dict[str, str]) -> None:
     common = {
         "agent": {"api_max_retries": 1},
         "telemetry": {"shared_metrics": {"enabled": False, "send": False, "offer_version": OFFER_VERSION}},
@@ -181,7 +191,8 @@ def write_home(manager_url: str, analyst_url: str) -> None:
                    mcp_servers={"atlassian": {"command": sys.executable, "args": [str(FIXTURE_MCP)],
                                               "env": {"PARITY_MCP_CANARY": CANARY, "PYTHONPATH": str(AGENT)},
                                               "connect_timeout": 60, "timeout": 60}})
-    implementer = dict(common, model=model(analyst_url))
+    implementer = dict(common, model=model(analyst_url), mcp_servers={
+        name: {"url": url, "connect_timeout": 15, "timeout": 30} for name, url in remote.items()})
     homes = {"default": HH, "analyst": HH / "profiles/analyst", "implementer": HH / "profiles/implementer"}
     for name, cfg in (("default", default), ("analyst", analyst), ("implementer", implementer)):
         homes[name].mkdir(parents=True, exist_ok=True)
@@ -189,7 +200,66 @@ def write_home(manager_url: str, analyst_url: str) -> None:
         (homes[name] / ".env").write_text("OPENAI_API_KEY=sk-fake-e2e\n", encoding="utf-8")
     (HH / "plugins").mkdir(exist_ok=True)
     (HH / "plugins/profile-tasks").symlink_to(REPO / "profile-tasks")
-    EVIDENCE["configs"] = {"default": default, "analyst": analyst}
+    EVIDENCE["configs"] = {"default": default, "analyst": analyst, "implementer": implementer}
+
+
+class _Unauthorized(BaseHTTPRequestHandler):
+    """A remote MCP endpoint whose sign-in is rejected: every request gets 401."""
+
+    def _refuse(self) -> None:
+        body = b'{"error":"unauthorized"}'
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = do_DELETE = _refuse
+
+    def log_message(self, *args) -> None:
+        EVIDENCE.setdefault("unauthorized_requests", []).append(args[0] % args[1:])
+
+
+def _die_with_parent() -> None:
+    import ctypes
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+
+
+def start_remote_mcp() -> tuple[dict[str, str], list]:
+    """The implementer's two remote MCP servers; returns their URLs and what to stop."""
+    refuser = ThreadingHTTPServer(("127.0.0.1", 0), _Unauthorized)
+    threading.Thread(target=refuser.serve_forever, name="e2e-401", daemon=True).start()
+    root = HOME.parent / "mcp-linear"
+    root.mkdir(exist_ok=True)
+    (root / "401_budget").write_text("1000", encoding="utf-8")
+    env = {"PATH": os.environ["PATH"], "HOME": str(HOME), "PYTHONPATH": str(AGENT), "MCPE2E_TRANSPORT": "http",
+           "MCPE2E_PORT_FILE": str(root / "port"), "MCPE2E_LOG": str(root / "inbound.jsonl"),
+           "MCPE2E_401_CALLS": str(root / "401_budget"), "MCPE2E_NAME": CALL_SERVER}
+    err = open(root / "stderr", "wb")
+    proc = subprocess.Popen([sys.executable, str(HTTP_FIXTURE_MCP)], env=env, stdin=subprocess.DEVNULL,
+                            stdout=err, stderr=err, preexec_fn=_die_with_parent)
+    deadline = time.monotonic() + 60
+    while not (root / "port").exists():
+        if proc.poll() is not None or time.monotonic() > deadline:
+            raise RuntimeError(f"HTTP MCP fixture did not start: {(root / 'stderr').read_text()[-500:]}")
+        time.sleep(0.2)
+    port = (root / "port").read_text().split()[0]
+    EVIDENCE["remote_mcp"] = {"inbound_log": str(root / "inbound.jsonl")}
+    return ({LOGIN_SERVER: f"http://127.0.0.1:{refuser.server_address[1]}/mcp",
+             CALL_SERVER: f"http://127.0.0.1:{port}/mcp"}, [refuser, proc])
+
+
+def stop_remote_mcp(handles: list) -> None:
+    refuser, proc = handles
+    refuser.shutdown()
+    refuser.server_close()
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(10)
 
 
 # ---- gateway ------------------------------------------------------------------------------------
@@ -879,6 +949,63 @@ async def trial_restart(ctx) -> None:
                   f"is injected", status=again, injected=woke)
 
 
+def mcp_auth_notices(task_id: str) -> list[dict]:
+    task = plugin_task(task_id)
+    return [n for n in list(task.get("notices") or []) + list(task.get("outbox") or []) if n["kind"] == "mcp_auth"]
+
+
+async def trial_mcp_auth(ctx) -> None:
+    """A target profile's MCP server needing a new sign-in is reported to the manager, once per server and task."""
+    async with Client("default") as mgr, Client("implementer") as viewer:
+        sid = await manager_session(mgr)
+        ack = await start_task(ctx, mgr, sid, "REAUTH", "mcp re-auth", profile="implementer")
+        task_id, isid = ack["task_id"], ack["session_id"]
+        await viewer.rpc("session.resume", session_id=isid, omit_messages=True)
+        answer = await until(lambda: manager_got(ctx["m"], f"Answer from implementer for task {task_id}"), 120,
+                             "re-auth task answer")
+        status = (await viewer.rpc("session.info", session_id=isid)).get("mcp_servers")
+        login = await until(lambda: manager_saw(ctx["m"], f"MCP server '{LOGIN_SERVER}' of the implementer"), 60,
+                            "login-server notice")
+        check("mcp_auth", f"hermes -p implementer mcp login {LOGIN_SERVER}" in login and f"Task {task_id}" in login,
+              "hook (a): a remote implementer MCP server that refuses its sign-in (status failed) is reported to the "
+              "manager conversation with the profile, the server and the login command",
+              notice=login, implementer_mcp_status=status, answer=answer[:300])
+        completes = [f.get("payload") for f in viewer.frames if f.get("type") == "tool.complete"]
+        results = [(p or {}).get("result") for p in completes]
+        parsed = [json.loads(x) if isinstance(x, str) and x.startswith("{") else x for x in results]
+        refused = [x for x in parsed if isinstance(x, dict) and x.get("needs_reauth") is True]
+        call = manager_saw(ctx["m"], f"MCP server '{CALL_SERVER}' of the implementer")
+        served_401 = [line for line in Path(EVIDENCE["remote_mcp"]["inbound_log"]).read_text().splitlines()
+                      if "injected_401_for" in line]
+        # This Hermes folds a tools/call 401 into a generic MCPError (upstream #121285): no needs_reauth.
+        check("mcp_auth", bool(served_401) and bool(completes) and (bool(refused) == bool(call)),
+              "hook (b), real path: a 401 on tools/call from the implementer's remote server; the manager gets a "
+              "notice exactly when the tool result carries needs_reauth (this Hermes does not set it for a 401; "
+              "the frame handling is proven by tests/test_mcp_reauth.py)",
+              server_answered_401=len(served_401), tool_results=results, needs_reauth_results=refused, notice=call)
+        first = mcp_auth_notices(task_id)
+        await call_tool(ctx, mgr, sid, {"action": "follow_up", "task_id": task_id,
+                                        "text": "SCENARIO:REAUTHAGAIN try again"}, "follow_up")
+        await until(lambda: manager_got(ctx["m"], "REAUTHAGAIN-RESULT"), 120, "second turn answer")
+        await asyncio.sleep(3)
+        again = mcp_auth_notices(task_id)
+        texts = [n.get("text") or "" for n in again]
+        expected = sorted([LOGIN_SERVER] + ([CALL_SERVER] if refused else []))
+        check("mcp_auth", len(first) == len(expected) and len(again) == len(expected)
+              and not plugin_task(task_id).get("outbox")
+              and sorted(plugin_task(task_id).get("mcp_auth_noticed") or []) == expected,
+              "one notice per server per task: the server state is read at the start and end of each turn, and a "
+              "second turn of the task hitting the same servers adds none; every notice was taken by the manager "
+              "conversation",
+              notices_after_first_turn=[n["id"] for n in first], notices_after_second_turn=[n["id"] for n in again],
+              kept=texts if plugin_task(task_id).get("outbox") else [], noticed=expected)
+    analyst_tasks = [t for t in json.loads(next((HH / "plugin-data").glob("*/state.json")).read_text())["tasks"].values()
+                     if t.get("profile") == "analyst"]
+    check("mcp_auth", not any(t.get("mcp_auth_noticed") for t in analyst_tasks),
+          "a target whose MCP servers are all fine (analyst) gets no re-authentication notice",
+          analyst_tasks=len(analyst_tasks))
+
+
 async def trial_bad_target(ctx) -> None:
     async with Client("default") as mgr:
         sid = await manager_session(mgr)
@@ -891,14 +1018,17 @@ async def trial_bad_target(ctx) -> None:
 
 TRIALS = {"1-2-3": trial_1_2_3, "4": trial_4, "5": trial_5, "6": trial_6, "7": trial_7, "8": trial_8,
           "9": trial_9, "limit": trial_timeout_status, "targets": trial_bad_target, "restart": trial_restart,
-          "followup": trial_followup, "retry": trial_notice_retry,
+          "followup": trial_followup, "retry": trial_notice_retry, "mcp_auth": trial_mcp_auth,
           # Last: its 'always' relay permanently allows recursive delete in the analyst profile.
           "approval": trial_approval}
 
 
 async def main(selected: list[str]) -> int:
-    with FakeLLMServer(manager_model) as m, FakeLLMServer(analyst_model) as a:
-        write_home(m.base_url, a.base_url)
+    remote, remote_handles = start_remote_mcp()
+    with FakeLLMServer(manager_model) as m, FakeLLMServer(analyst_model) as a, \
+            contextlib.ExitStack() as cleanup:
+        cleanup.callback(stop_remote_mcp, remote_handles)
+        write_home(m.base_url, a.base_url, remote)
         ctx = {"m": m, "a": a, "proc": start_gateway()}
         try:
             async with Client("default"):
