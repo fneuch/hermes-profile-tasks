@@ -11,7 +11,12 @@ profile served by the same Hermes gateway.
   conversation (`ctx.inject_message`), which starts a manager turn.
 - `follow_up`: sends a new text to the same session (same context).
 - `correct`: steers the running turn of the task (`prompt.receipt` then `session.steer`).
-- `status`: lists the tasks from the plugin state and the allowed targets.
+- `status`: lists the tasks from the plugin state and the allowed targets. For a task nobody waits on
+  any more (past the wait limit, a wait cut off, or a gateway restart, detected by the waiting
+  process being gone) it reads the target turn's receipt: a late answer is returned once in the
+  status result (not injected); a turn cut off by the restart is reported with its state
+  (`interrupted`, or `unknown`, in which case the target session stays paused until a person
+  resends or discards the turn in the desktop).
 - Wait limit: 30 minutes by default. Past it the manager gets a message: no answer yet, the work
   is not cancelled, check back with `status`.
 - Targets: every profile the gateway serves (`gateway_state.json` `served_profiles`) except the caller.
@@ -49,9 +54,12 @@ Both run against an isolated Hermes home under `~/.cache/profile-tasks-e2e/<time
 only read (code and interpreter).
 
 - `PT_SCRIPT=tests/test_load_check.py e2e/run.sh`: load-time check, with all internals and with one removed.
-- `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets`). Evidence
+- `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets restart`). Evidence
   is written to `e2e/evidence/run-<timestamp>.json`. The analyst profile gets a fixture MCP server
   named `atlassian` (from the Hermes test fixtures) whose answer carries a per-run token set only
   in the analyst config.
+
+`e2e/run.sh` stops the isolated gateway on every exit (end, failure, Ctrl-C, TERM) through that
+home's own control socket (`e2e/stop_gateway.py HERMES_HOME`, which refuses the real `~/.hermes`).
 
 Trial 9 (clicking the link in the desktop) is not covered: the isolated run has no desktop app.

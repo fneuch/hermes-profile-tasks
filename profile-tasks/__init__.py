@@ -12,6 +12,7 @@ import asyncio
 import contextvars
 import inspect
 import logging
+import os
 import threading
 import time
 import uuid
@@ -34,6 +35,8 @@ _REQUIRED_FIELDS = {
     "session.steer": {"session_id", "execution_generation", "text"},
 }
 _STATE_LOCK = threading.Lock()
+WAITING = ("starting", "running")
+REFRESHABLE = ("starting", "running", "waiting_timeout", "wait_lost")
 
 TARGET_GUIDANCE = (
     "Nobody watches this session live and nobody can answer a clarify question here. "
@@ -184,6 +187,29 @@ class _Connection:
                 return
 
 
+def _process_token(pid: int) -> str:
+    """pid plus its start time (Linux /proc), so a reused pid does not pass for the waiting process."""
+    try:
+        start = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        start = ""
+    return f"{pid}:{start}"
+
+
+def _waiter_alive(token: str | None) -> bool:
+    """Whether the process that recorded *token* is still the one running under that pid."""
+    if not token:
+        return False
+    pid = int(token.split(":", 1)[0])
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return _process_token(pid) == token
+
+
 def _final_text(receipt: dict) -> tuple[bool, str]:
     """(succeeded, text) from a terminal receipt."""
     result = receipt.get("result") or {}
@@ -273,7 +299,8 @@ class ProfileTasks:
         task_id = "t-" + uuid.uuid4().hex[:8]
         label = f"Task {task_id}" + (f": {title.strip()[:80]}" if title and title.strip() else "")
         self.store.update(task_id, task_id=task_id, profile=profile, caller_session_key=caller_key,
-                          title=label, created_at=time.time(), status="starting", session_id=None, turns=[])
+                          title=label, created_at=time.time(), status="starting", session_id=None, turns=[],
+                          waiter=_process_token(os.getpid()))
         return self._send(task_id, text, create=True)
 
     def follow_up(self, task_id: str, text: str) -> dict:
@@ -321,8 +348,10 @@ class ProfileTasks:
                 accepted["error"] = f"{exc.__class__.__name__}: {exc}"
                 ready.set()
             else:
-                self._deliver(task_id, f"Task {task_id} did not complete: {exc.__class__.__name__}: {exc}. "
-                                       "The target session still exists.", status="failed")
+                error = f"{exc.__class__.__name__}: {exc}"
+                self._deliver(task_id, f"Task {task_id}: the wait for the answer was cut off ({error}). The work in "
+                                       f"the target session may still finish. Check with profile_task action=status "
+                                       f"task_id={task_id}.", status="wait_lost", error=error)
 
     async def _send_and_wait(self, task_id: str, text: str, create: bool, accepted: dict,
                              ready: threading.Event) -> None:
@@ -342,7 +371,8 @@ class ProfileTasks:
                                      submission_id=submission_id)
             admission_id = receipt["admission_id"]
             turns = list(self.store.get(task_id).get("turns") or []) + [admission_id]
-            self.store.update(task_id, status="running", admission_id=admission_id, turns=turns)
+            self.store.update(task_id, status="running", admission_id=admission_id, turns=turns,
+                              waiter=_process_token(os.getpid()))
             ready.set()
             deadline = time.monotonic() + self._wait_seconds()
             try:
@@ -419,10 +449,79 @@ class ProfileTasks:
             if task_id not in tasks:
                 raise ValueError(f"unknown task {task_id}")
             tasks = {task_id: tasks[task_id]}
+        extra: dict[str, dict] = {}
+        for tid, task in tasks.items():
+            if task.get("status") in REFRESHABLE and not (task.get("status") in WAITING and _waiter_alive(task.get("waiter"))):
+                extra[tid] = self._refresh(task)
+                tasks[tid] = self.store.get(tid) or task
         keep = ("task_id", "profile", "status", "session_id", "title", "delivered", "error", "created_at", "updated_at")
-        rows = [{k: t.get(k) for k in keep} | {"link": f"hermes://open/{t['session_id']}" if t.get("session_id") else None}
-                for t in tasks.values()]
+        rows = []
+        for tid, t in tasks.items():
+            row = {k: t.get(k) for k in keep}
+            row["link"] = f"hermes://open/{t['session_id']}" if t.get("session_id") else None
+            if task_id and t.get("last_answer") and "answer" not in extra.get(tid, {}):
+                row["answer"] = t["last_answer"]
+            rows.append(row | extra.get(tid, {}))
         return {"tasks": sorted(rows, key=lambda r: r.get("created_at") or 0), "targets": self.targets()}
+
+    def _refresh(self, task: dict) -> dict:
+        """Re-read the receipt of a task nobody waits for any more; record and return what it says."""
+        task_id, profile, session_id = task["task_id"], task["profile"], task.get("session_id")
+        restarted = task.get("status") in WAITING
+        if restarted:
+            restart_note = "The gateway restarted while this task was waiting, so no answer was injected. "
+        elif task.get("status") == "wait_lost":
+            restart_note = (f"The plugin lost its connection to {profile} while waiting ({task.get('error')}), "
+                            f"so no answer was injected. ")
+        else:
+            restart_note = ""
+        if not session_id or not task.get("admission_id"):
+            error = "the gateway restarted before the target accepted the task" if restarted else "not accepted yet"
+            if restarted:
+                self.store.update(task_id, status="failed", error=error)
+            return {"note": f"{restart_note}The task was never accepted by {profile}. Start it again."}
+        box: dict = {}
+        context = contextvars.copy_context()
+
+        def run() -> None:
+            try:
+                box["receipt"] = asyncio.run(self._read_receipt(task))
+            except Exception as exc:  # noqa: BLE001 - reported to the manager as the status
+                box["error"] = f"{exc.__class__.__name__}: {exc}"
+
+        thread = threading.Thread(target=context.run, args=(run,), name=f"profile-task-status-{task_id}", daemon=True)
+        thread.start()
+        thread.join(ACK_TIMEOUT_SECONDS)
+        receipt = box.get("receipt")
+        if receipt is None:
+            if restarted:
+                self.store.update(task_id, status="wait_lost")
+            return {"note": f"{restart_note}Could not read the turn's state from {profile}: "
+                            f"{box.get('error', 'timed out')}. The {profile} session {session_id} still exists."}
+        state = receipt.get("status")
+        if state not in ("terminal", "unknown"):
+            if restarted or task.get("status") == "wait_lost":
+                self.store.update(task_id, status="waiting_timeout")
+            return {"turn": state, "note": f"{restart_note}{profile} is still on it (turn {state}). The work is "
+                                            f"not cancelled. Check back later with action=status."}
+        ok, body = _final_text(receipt)
+        if ok:
+            self.store.update(task_id, status="answered", last_answer=body, delivered=True, delivered_by="status")
+            return {"turn": state, "answer": body,
+                    "note": f"{restart_note}Answer read from the {profile} session after the wait ended."}
+        self.store.update(task_id, status="failed", error=body, delivered=True, delivered_by="status")
+        if state == "unknown":
+            return {"turn": state, "note": (
+                f"{restart_note}Hermes marked the turn unknown: the gateway stopped while it ran, so it did "
+                f"not finish ({body}). The {profile} session {session_id} is paused on that turn until a person "
+                f"resends or discards it in the desktop; a follow_up queues behind it until then.")}
+        return {"turn": state, "note": f"{restart_note}The turn did not complete: {body}. The {profile} "
+                                       f"session {session_id} still exists."}
+
+    async def _read_receipt(self, task: dict) -> dict:
+        async with _Connection(self._home(task["profile"])) as conn:
+            return await conn.rpc("prompt.receipt", session_id=task["session_id"], admission_id=task["admission_id"],
+                                  include_result=True)
 
 
 SCHEMA = {
@@ -433,7 +532,8 @@ SCHEMA = {
         "tokens. action=start returns at once with a task id and the session; the final answer arrives later "
         "in this conversation as a new message, so end your turn after starting. action=follow_up sends a "
         "new message in the same task session. action=correct steers the turn that is running now. "
-        "action=status lists tasks and their state."
+        "action=status lists tasks and their state; for a task nobody waits on any more (past the wait limit, "
+        "or a gateway restart) it reads the target turn and returns the late answer or what happened."
     ),
     "parameters": {
         "type": "object",

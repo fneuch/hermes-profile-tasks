@@ -26,6 +26,9 @@ import yaml
 from hermes_cli.observability.shared_metrics_consent import OFFER_VERSION
 from tests.fakes.fake_llm_provider import MODEL_ID, FakeLLMServer, Text, ToolCall
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from stop_gateway import alive, stop as stop_by_socket  # noqa: E402
+
 HOME = Path(os.environ["HOME"])
 HH = Path(os.environ["HERMES_HOME"])
 REPO = Path(os.environ["PT_REPO"])
@@ -39,6 +42,7 @@ MCP_TOOL = "mcp__atlassian__parity_canary"
 CANARY = "ANALYST-ONLY-" + uuid.uuid4().hex[:10]
 EVIDENCE: dict = {"base": str(HOME.parent), "canary": CANARY, "checks": []}
 WAIT_LIMIT = 25
+HANG_SECONDS = 45
 
 
 def log(*parts: object) -> None:
@@ -123,6 +127,9 @@ def analyst_model(record: dict):
     if tag == "SLOW":
         time.sleep(WAIT_LIMIT + 15)
         return Text("SLOW-DONE", reasoning=reasoning)
+    if tag.startswith("HANG"):
+        time.sleep(HANG_SECONDS)
+        return Text(f"{tag}-DONE", reasoning=reasoning)
     last = messages[-1]
     if last.get("role") == "user" and "CORRECTION-" in text_of(last):
         return Text("SECOND-TURN for correction", reasoning=reasoning)
@@ -178,24 +185,18 @@ def start_gateway() -> subprocess.Popen:
     return proc
 
 
-def stop_gateway(proc: subprocess.Popen) -> None:
-    if proc.poll() is None:
-        with contextlib.suppress(Exception):
-            subprocess.run([sys.executable, "-c", "import sys; from gateway.status import write_planned_stop_marker as w; "
-                            "w(int(sys.argv[1]))", str(proc.pid)], cwd=AGENT, timeout=60, check=False)
-        time.sleep(1)
+def stop_gateway(proc: subprocess.Popen | None) -> None:
+    """Stop whatever gateway owns the isolated home (its control socket), then the child we started."""
+    with contextlib.suppress(Exception):
+        stop_by_socket(HH)
+    if proc is not None and proc.poll() is None:
         with contextlib.suppress(ProcessLookupError):
             os.kill(proc.pid, signal.SIGTERM)
         try:
             proc.wait(60)
         except subprocess.TimeoutExpired:
             proc.kill()
-    # Detached gateways a client may have started for a profile of this isolated home.
-    for pid_file in [HH / "gateway.pid", *HH.glob("profiles/*/gateway.pid")]:
-        with contextlib.suppress(Exception):
-            pid = json.loads(pid_file.read_text()).get("pid") if pid_file.read_text().strip().startswith("{") \
-                else int(pid_file.read_text().split()[0])
-            os.kill(int(pid), signal.SIGTERM)
+            proc.wait(10)
 
 
 class Client:
@@ -475,6 +476,12 @@ async def trial_9(ctx) -> None:
           link=ack.get("link"), session_id=ack.get("session_id"))
 
 
+async def ask_status(ctx, mgr: Client, sid: str, task_id: str) -> dict:
+    before = len(ctx["m"].main_requests())
+    await say(mgr, sid, "CALL " + json.dumps({"action": "status", "task_id": task_id}))
+    return await until(lambda: tool_result_of(ctx["m"], "status", before), 180, "status")
+
+
 async def trial_timeout_status(ctx) -> None:
     async with Client("default") as mgr:
         sid = await manager_session(mgr)
@@ -484,12 +491,74 @@ async def trial_timeout_status(ctx) -> None:
         wake = await until(lambda: manager_got(ctx["m"], f"Task {task_id}"), WAIT_LIMIT + 60, "timeout message")
         check("limit", "not cancelled" in wake, "past the wait limit the manager is told to check back",
               seconds=round(time.monotonic() - t0, 1), wake_message=wake)
-        before = len(ctx["m"].main_requests())
-        await say(mgr, sid, "CALL " + json.dumps({"action": "status", "task_id": task_id}))
-        status = await until(lambda: tool_result_of(ctx["m"], "status", before), 60, "status")
-        check("status", status["tasks"][0]["status"] == "waiting_timeout" and "analyst" in status["targets"]
-              and "default" not in status["targets"], "status lists the task and the targets exclude the caller",
-              status=status)
+        early = await ask_status(ctx, mgr, sid, task_id)
+        row = early["tasks"][0]
+        check("status", row["status"] == "waiting_timeout" and row.get("turn") in ("queued", "started")
+              and "analyst" in early["targets"] and "default" not in early["targets"],
+              "before the late answer: status reads the turn as still running, targets exclude the caller",
+              status=early)
+        await until(lambda: any("SLOW-DONE" in r[1] for r in analyst_db(
+            "SELECT role, coalesce(content, '') FROM messages WHERE session_id = ?", (ack["session_id"],))),
+            120, "late analyst answer stored")
+        late = await ask_status(ctx, mgr, sid, task_id)
+        row = late["tasks"][0]
+        injected = [b for b in ctx["m"].main_requests() if b["messages"][-1].get("role") == "user"
+                    and "SLOW-DONE" in text_of(b["messages"][-1])]
+        check("late", row["status"] == "answered" and "SLOW-DONE" in (row.get("answer") or "")
+              and row.get("delivered") is True and not injected,
+              "after the wait limit, status fetched the answer that arrived later and handed it to the manager",
+              status=late, analyst_session=ack["session_id"], seconds_since_start=round(time.monotonic() - t0, 1))
+        again = await ask_status(ctx, mgr, sid, task_id)
+        check("late", again["tasks"][0]["status"] == "answered" and "note" not in again["tasks"][0],
+              "a second status keeps the answer and does not re-read the target", status=again)
+
+
+async def restart_gateway(ctx, how: str) -> dict:
+    """Stop the isolated gateway (control socket ``force`` or SIGKILL) and start a new one."""
+    old = ctx["proc"]
+    t0 = time.monotonic()
+    if how == "kill":
+        os.kill(old.pid, signal.SIGKILL)
+        old.wait(30)
+    else:
+        stop_by_socket(HH)
+        old.wait(90)
+    stopped = {"how": how, "old_pid": old.pid, "old_alive": alive(old.pid),
+               "stop_seconds": round(time.monotonic() - t0, 1)}
+    ctx["proc"] = start_gateway()
+    async with Client("default"):
+        pass
+    stopped["new_pid"] = ctx["proc"].pid
+    return stopped
+
+
+async def trial_restart(ctx) -> None:
+    for how in ("socket", "kill"):
+        tag = f"HANG{how.upper()}"
+        async with Client("default") as mgr:
+            sid = await manager_session(mgr)
+            ack = await start_task(ctx, mgr, sid, tag, f"restart {how}")
+            task_id = ack["task_id"]
+            await until(lambda: any(f"SCENARIO:{tag}" in text_of(m) for b in ctx["a"].main_requests()
+                                    for m in b["messages"]), 60, "analyst turn running")
+            hang_end = time.monotonic() + HANG_SECONDS + 5
+        restarted = await restart_gateway(ctx, how)
+        async with Client("default") as mgr:
+            sid = await manager_session(mgr)
+            status = await ask_status(ctx, mgr, sid, task_id)
+            row = status["tasks"][0]
+            note = row.get("note") or ""
+            check("restart", row["status"] != "running" and ("restarted" in note or "lost its connection" in note),
+                  f"gateway {how} stop while the task runs: status says the wait was lost and what happened",
+                  restart=restarted, status=status, analyst_session=ack["session_id"])
+            # Past the time the cut-off model call would have answered.
+            await until(lambda: time.monotonic() >= hang_end, HANG_SECONDS + 60, "hang window over")
+            again = await ask_status(ctx, mgr, sid, task_id)
+            woke = manager_got(ctx["m"], f"{tag}-DONE")
+            check("restart", again["tasks"][0]["status"] != "running" and not woke,
+                  f"after the {how} restart nothing waits silently: a later status still reports, no late answer "
+                  f"is injected",
+                  status=again, injected=woke)
 
 
 async def trial_bad_target(ctx) -> None:
@@ -503,14 +572,13 @@ async def trial_bad_target(ctx) -> None:
 
 
 TRIALS = {"1-2-3": trial_1_2_3, "4": trial_4, "5": trial_5, "6": trial_6, "7": trial_7, "8": trial_8,
-          "9": trial_9, "limit": trial_timeout_status, "targets": trial_bad_target}
+          "9": trial_9, "limit": trial_timeout_status, "targets": trial_bad_target, "restart": trial_restart}
 
 
 async def main(selected: list[str]) -> int:
     with FakeLLMServer(manager_model) as m, FakeLLMServer(analyst_model) as a:
         write_home(m.base_url, a.base_url)
-        proc = start_gateway()
-        ctx = {"m": m, "a": a}
+        ctx = {"m": m, "a": a, "proc": start_gateway()}
         try:
             async with Client("default"):
                 pass
@@ -526,7 +594,7 @@ async def main(selected: list[str]) -> int:
                 except Exception as exc:  # noqa: BLE001 - a trial that cannot finish is a failure
                     check(name, False, f"trial did not finish: {exc.__class__.__name__}: {exc}")
         finally:
-            stop_gateway(proc)
+            stop_gateway(ctx["proc"])
             EVIDENCE["manager_requests"] = len(m.main_requests())
             EVIDENCE["manager_bodies_tail"] = [b["messages"][-3:] for b in m.main_requests()[-4:]]
             EVIDENCE["analyst_requests"] = len(a.main_requests())
@@ -537,5 +605,10 @@ async def main(selected: list[str]) -> int:
     return 0 if all(c["ok"] for c in EVIDENCE["checks"]) else 1
 
 
+def _terminate(signum, frame):
+    raise SystemExit(128 + signum)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _terminate)
     sys.exit(asyncio.run(main(sys.argv[1:])))
