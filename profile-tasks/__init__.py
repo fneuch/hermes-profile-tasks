@@ -349,8 +349,15 @@ def _mcp_runtime(profile_home: Path) -> dict[str, Any]:
     home = profile_home.resolve()
     with core._lock:
         items = list(core._servers.items())
-    return {key[1]: (key, server) for key, server in items
-            if isinstance(key, tuple) and len(key) == 2 and Path(str(key[0])).resolve() == home}
+    runtime = {}
+    for key, server in items:
+        if not (isinstance(key, tuple) and len(key) == 2):
+            # e.g. a session tool scope's connection: not a profile's own server.
+            logger.debug("profile-tasks: MCP connection key %r skipped (not (profile home, name))", key)
+            continue
+        if Path(str(key[0])).resolve() == home:
+            runtime[key[1]] = (key, server)
+    return runtime
 
 
 def _mcp_rejected_auth(server: Any) -> bool:
@@ -732,11 +739,15 @@ class ProfileTasks:
         if not error:
             return
         name = str(payload["name"])
+        noticed = task.get("mcp_auth_noticed") or []
         try:
             from tools.mcp_tool import _mcp_tool_server_names
             from tools.mcp_tool_schema import sanitize_mcp_name_component
-            runtime = _mcp_runtime(self._home(task["profile"]))
             server = _mcp_tool_server_names.get(name)
+            # Already noticed for this task: skip the locked read of every connection.
+            if server in noticed or any(name.startswith(f"mcp__{sanitize_mcp_name_component(s)}__") for s in noticed):
+                return
+            runtime = _mcp_runtime(self._home(task["profile"]))
             if server not in runtime:
                 # The generated name is lossy; match it against this profile's own servers.
                 server = next((s for s in sorted(runtime, key=len, reverse=True)

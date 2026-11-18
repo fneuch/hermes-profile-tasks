@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -161,6 +162,39 @@ def main() -> int:
     check(len(ctx.injected) == before + 2 and "mcp login jira" in ctx.injected[-1][0],
           "a remote server whose error text says 401/unauthorized gives a notice",
           injected=ctx.injected[before + 1:])
+
+    # A server already noticed for the task does not read the connections again.
+    reads, real_runtime = [], mod._mcp_runtime
+    mod._mcp_runtime = lambda home_: reads.append(home_) or real_runtime(home_)
+    try:
+        plugin._on_target_frame("t-d", frame("s-d", generic))
+    finally:
+        mod._mcp_runtime = real_runtime
+    check(not reads and len(ctx.injected) == before + 2, "a failure on an already-noticed server skips the "
+          "connection read", reads=reads)
+
+    # A connection not keyed by (profile home, name), e.g. a session tool scope's, is skipped with a debug log.
+    scope_key = ("scope", home, "linear")
+    with core._lock:
+        core._servers[scope_key] = Conn(True, 401)
+    records = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    grab, old_level = Grab(level=logging.DEBUG), mod.logger.level
+    mod.logger.addHandler(grab)
+    mod.logger.setLevel(logging.DEBUG)
+    try:
+        runtime = mod._mcp_runtime(plugin._home("implementer"))
+    finally:
+        mod.logger.removeHandler(grab)
+        mod.logger.setLevel(old_level)
+        with core._lock:
+            core._servers.pop(scope_key, None)
+    check(sorted(runtime) == sorted(conns) and any("skipped" in r and "scope" in r for r in records),
+          "a session-scope connection key is skipped with a debug log", runtime=sorted(runtime), logs=records)
 
     # Set aside: an open breaker after 401s, or a park; a breaker without a 401 is not an auth problem.
     key_l, key_s = (home, "linear"), (home, "slack")

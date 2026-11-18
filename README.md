@@ -66,16 +66,25 @@ profile served by the same Hermes gateway.
   the tool to its server (Hermes' tool-to-server map, else the target profile's server names) and
   sends the notice when that connection's last HTTP error is a 401, or, for a remote server, when
   the error text says 401 / unauthorized / invalid token. A stdio server's error text is not
-  trusted: it may relay its own API's 401.
+  trusted: it may relay its own API's 401. The error-text fallback has a known false positive: a
+  hosted (remote) MCP server that relays a third-party API's 401 in its error text gets a notice
+  while its own connection is fine.
 - A server Hermes set aside: after 3 failed calls Hermes opens a circuit breaker and refuses that
   server's calls for 60 s, while `session.info` still shows it `connected` with no `needs_auth`.
   A server whose reconnects are exhausted is parked (`failed` in `session.info`). At each state
   read the plugin also reads the target profile's connections in the gateway process and sends
   the notice for one whose breaker is open or that is parked, when its last HTTP error is a 401.
-  A breaker opened by other errors (500, timeouts) gets no notice.
-- These two checks read Hermes internals (`tools.mcp_tool._servers`, `_http_rejection`,
-  `_server_error_counts`, `_server_breaker_opened_at`, `_mcp_tool_server_names`). If they change,
-  the check logs a warning and the task goes on; it does not fail the load check.
+  A breaker opened by a 500 gets no notice. A breaker opened by timeouts or connection resets can
+  give an unneeded notice: Hermes clears the stored last HTTP error (`_http_rejection`) only when it
+  opens a new HTTP connection, so a 401 recorded during an OAuth sign-in or token refresh stays on
+  record, and later timeouts or resets on that connection are read as a 401.
+- Connections not keyed by (profile home, server name), such as a session tool scope's, are
+  skipped (debug log).
+- These two checks read Hermes internals: in `tools.mcp_tool`, `_servers`, `_lock`,
+  `_server_error_counts`, `_server_breaker_opened_at`, `_CIRCUIT_BREAKER_THRESHOLD`,
+  `_CIRCUIT_BREAKER_COOLDOWN_SEC` and `_mcp_tool_server_names`; on a connection, `_http_rejection`,
+  `_park_reason`, `session` and `_is_http()`; and `tools.mcp_tool_schema.sanitize_mcp_name_component`.
+  If they change, the check logs a warning and the task goes on; it does not fail the load check.
 - Targets: every profile the gateway serves (`gateway_state.json` `served_profiles`) except the caller.
 - The target runs with its own config, MCP servers and tokens. The manager only gets text back.
 - At load time the plugin checks the Hermes internals it uses, including the plugin context's
@@ -114,7 +123,8 @@ only read (code and interpreter).
 - `PT_SCRIPT=tests/test_load_check.py e2e/run.sh`: load-time check, with all internals and with one removed.
 - `PT_SCRIPT=tests/test_mcp_reauth.py e2e/run.sh`: the `needs_reauth` tool-result notice (one per
   server and task, kept when the manager conversation refuses it, approvals unaffected), the
-  generic-error 401 mapping (no notice for a 500, a stdio server, a non-MCP tool), and the
+  generic-error 401 mapping (no notice for a 500, a stdio server, a non-MCP tool; no connection
+  read for a server already noticed), the skipped session-scope connection key, and the
   set-aside reading (breaker open or parked after a 401; not after a 500 or past the cooldown).
 - `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets restart followup
   retry mcp_auth approval`; `approval` runs last because its relayed `always` permanently allows recursive
@@ -132,3 +142,9 @@ only read (code and interpreter).
 home's own control socket (`e2e/stop_gateway.py HERMES_HOME`, which refuses the real `~/.hermes`).
 
 Trial 9 (clicking the link in the desktop) is not covered: the isolated run has no desktop app.
+
+## Known issues
+
+- Flaky e2e trial `retry` (pre-existing, not fixed here): its closing check
+  `manager_saw('is waiting for an approval')` races the manager's model requests. It failed 5 runs
+  out of 5 standalone on 379e94b.
