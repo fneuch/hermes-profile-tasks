@@ -170,7 +170,10 @@ class TaskStore:
         return self.modify(task_id, lambda _task: fields)
 
     def modify(self, task_id: str, change: Any) -> dict | None:
-        """Store ``change(task)``'s fields in the task, read and written under one lock; None changes nothing."""
+        """Store ``change(task)``'s fields in the task, read and written under one lock; None changes nothing.
+
+        ``change`` must not call the store: it runs under _STATE_LOCK, which is not reentrant.
+        """
         with self._locked():
             tasks = dict(self._state.get(STATE_KEY, {}) or {})
             task = dict(tasks.get(task_id, {}))
@@ -300,9 +303,10 @@ def _ended_by_stop(task: dict, last: dict) -> bool:
     if last.get("outcome") not in ("cancelled", "interrupted") or "raised_at" not in last:
         return False
     ended = last.get("settled_at") or last["raised_at"] + float(last.get("settled_after_s") or 0)
+    # Only the latest cut can be this stop; an older one was an earlier, plain disconnect.
     cuts = [e["queued_at"] for e in list(task.get("outbox") or []) + list(task.get("notices") or [])
             if e.get("kind") == "wait_lost"]
-    return any(0 <= cut - ended <= STOP_GRACE_SECONDS for cut in cuts)
+    return bool(cuts) and 0 <= max(cuts) - ended <= STOP_GRACE_SECONDS
 
 
 def _notice(message: str, kind: str) -> dict:
@@ -764,8 +768,7 @@ class ProfileTasks:
 
     def _drop_notices(self, task_id: str, kind: str) -> None:
         with self._outbox_lock:
-            task = self.store.get(task_id) or {}
-            self.store.update(task_id, outbox=[e for e in task.get("outbox") or [] if e["kind"] != kind])
+            self.store.modify(task_id, lambda t: {"outbox": [e for e in t.get("outbox") or [] if e["kind"] != kind]})
 
     def _deliver(self, task_id: str, message: str, *, status: str, kind: str = "result", **fields: Any) -> None:
         self.store.update(task_id, status=status, **({"delivered": False} if kind == "result" else {}), **fields)
