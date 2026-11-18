@@ -499,6 +499,50 @@ async def trial_approval(ctx) -> None:
     # Relayed: the prompt opens in the manager conversation, the answer there runs the command.
     RELAY["on"] = True
     try:
+        # Relay card left open while the target request expires: the card is withdrawn, nothing is written back.
+        probe = HOME / "relayexpire-probe-dir"
+        async with Client("default") as mgr:
+            sid = await manager_session(mgr)
+            probe.mkdir(exist_ok=True)
+            before = len(ctx["m"].main_requests())
+            ack = await start_task(ctx, mgr, sid, "RELAYEXPIRE", "approval relay left open")
+            task_id, asid = ack["task_id"], ack["session_id"]
+            card = await until(lambda: next((f for f in mgr.frames if f.get("type") == "approval.request"
+                                             and f.get("session_id") == sid), None), APPROVAL_TIMEOUT,
+                               "manager card")
+            card_at = time.time()
+            payload = card["payload"]
+            relayed = await until(lambda: tool_result_of(ctx["m"], "approval", before), APPROVAL_TIMEOUT + 60,
+                                  "approval tool result")
+            # A withdrawn card ends the manager-side wait with choice "cancelled"; its own expiry would be "timeout".
+            frames_after = [f.get("type") for f in mgr.frames if f.get("session_id") == sid and f["_t"] >= card_at]
+            replay = await mgr.rpc("session.events.since", session_id=sid, last_seen=0)
+            still_open = [r for r in replay.get("open_requests") or [] if r.get("method") == "approval"]
+            state_at_end = plugin_task(task_id)
+            from hermes_cli.gateway_client import GatewayRPCError
+            try:
+                dead = await mgr.rpc("approval.respond", session_id=sid,
+                                     execution_generation=payload["execution_generation"],
+                                     prompt_id=payload["prompt_id"], choice="once")
+            except GatewayRPCError as exc:
+                dead = {"refused": f"{exc.__class__.__name__}: {exc}"}
+            await asyncio.sleep(3)
+            state_after = plugin_task(task_id)
+            ended = await until(lambda: manager_saw(ctx["m"], f"Task {task_id} (analyst): the approval for"), 120,
+                                "approval ending notice")
+            last = state_after.get("last_approval") or {}
+            check("approval", not still_open and relayed.get("forwarded") is False
+                  and relayed.get("manager_choice") == "cancelled"
+                  and state_after.get("pending_approval") is None and last.get("outcome") == "timeout"
+                  and not last.get("relayed") and "expired unanswered" in ended and probe.exists(),
+                  "relay card open while the target request expired: the card was withdrawn from the manager "
+                  "conversation, the approval tool reported nothing forwarded, answering the dead card wrote no "
+                  "pending approval back, and the manager got the real ending (timeout)",
+                  seconds_card_open=round(time.time() - card_at, 1), manager_frames_after_card=frames_after,
+                  manager_open_approval_requests=still_open,
+                  relay_result=relayed, dead_card_respond=dead, pending_at_end=state_at_end.get("pending_approval"),
+                  pending_after_dead_answer=state_after.get("pending_approval"), last_approval=last,
+                  ending_notice=ended[:300], probe_dir_exists=probe.exists(), analyst_session=asid)
         for choice, tag in (("once", "RELAY"), ("always", "RELAYALWAYS")):
             probe = HOME / f"{tag.lower()}-probe-dir"
             async with Client("default") as mgr:

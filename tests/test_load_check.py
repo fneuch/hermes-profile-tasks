@@ -1,5 +1,7 @@
 """Load-time check of the profile-tasks plugin: present internals pass, a removed one blocks the tool.
 
+Also: a plugin context without ``_manager`` blocks the tool.
+
 Run: ``PT_SCRIPT=tests/test_load_check.py e2e/run.sh`` (isolated HOME/HERMES_HOME, the installed Hermes
 interpreter).
 """
@@ -25,6 +27,7 @@ def load():
 class FakeCtx:
     profile_name = "default"
     state = None
+    _manager = None
 
     def __init__(self):
         self.tools = []
@@ -46,6 +49,31 @@ def main() -> int:
     missing = mod.check_internals()
     print("present internals -> missing:", missing)
     failures += bool(missing)
+
+    from hermes_cli.plugins_context import PluginContext
+    missing = mod.check_internals(PluginContext(None, object()))
+    print("real PluginContext -> missing:", missing)
+    failures += bool(missing)
+
+    class NoManagerCtx(FakeCtx):
+        def __getattribute__(self, name):
+            if name == "_manager":
+                raise AttributeError(name)
+            return super().__getattribute__(name)
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger().addHandler(handler)
+    ctx = NoManagerCtx()
+    mod.register(ctx)
+    logging.getLogger().removeHandler(handler)
+    logged = [r.getMessage() for r in records if r.levelno >= logging.ERROR]
+    reply = json.loads(ctx.tools[0]["handler"]({"action": "status"}))
+    print("context without _manager -> logged:", logged)
+    print("context without _manager -> tool reply:", reply)
+    name = "hermes_cli.plugins_context.PluginContext._manager"
+    failures += not (any(name in m for m in logged) and name in json.dumps(reply) and "error" in reply)
 
     import hermes_cli.gateway_client as gc
     saved = gc._session_ticket

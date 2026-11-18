@@ -57,9 +57,14 @@ TARGET_GUIDANCE = (
 )
 
 
-def check_internals() -> list[str]:
-    """Names of the Hermes internals this plugin uses that the running Hermes no longer has."""
+def check_internals(ctx: Any = None) -> list[str]:
+    """Names of the Hermes internals this plugin uses that the running Hermes no longer has.
+
+    With *ctx*, also checks that the plugin context still exposes its plugin manager as ``_manager``.
+    """
     missing: list[str] = []
+    if ctx is not None and not hasattr(ctx, "_manager"):
+        missing.append("hermes_cli.plugins_context.PluginContext._manager")
 
     def need(module: str, names: tuple[str, ...]) -> Any:
         try:
@@ -552,7 +557,12 @@ class ProfileTasks:
         settled = approval.get("settled_at") or time.time()
         record = {**approval, "outcome": name, "user_summary": summary,
                   "settled_after_s": round(settled - approval["raised_at"], 1)}
-        self.store.update(task_id, pending_approval=None, settling_approval=None, last_approval=record)
+        # Under the relay lock so a card answered now either forwards first or sees the approval gone.
+        with self._relay_lock:
+            self.store.update(task_id, pending_approval=None, settling_approval=None, last_approval=record)
+            relay = self._relays.get(approval["prompt_id"])
+        if relay is not None and not relay.get("forwarded"):
+            self._withdraw_manager_card(relay, "the request in the target session ended")
         if approval.get("relayed"):
             return
         profile, session_id = task.get("profile"), task.get("session_id")
@@ -623,13 +633,19 @@ class ProfileTasks:
                                 + ("still pending until " + expires if still else "no longer pending") + "."}
             if choice != "deny" and choice not in pending["choices"]:
                 choice = "once"
-            relay["forwarded"] = True
-            self.store.update(task_id, pending_approval={**pending, "relayed": True, "relayed_choice": choice})
+            with self._relay_lock:
+                current = (self.store.get(task_id) or {}).get("pending_approval") or {}
+                if current.get("prompt_id") == prompt_id:
+                    relay["forwarded"] = True
+                    self.store.update(task_id, pending_approval={**current, "relayed": True,
+                                                                 "relayed_choice": choice})
             answer = self._run_async(self._respond(task, pending, choice))
         finally:
             with self._relay_lock:
                 self._relays.pop(prompt_id, None)
-        return {"task_id": task_id, "forwarded": True, "choice": choice, "target_answer": answer,
+        # forwarded stays False when the approval ended while the card was open.
+        return {"task_id": task_id, "forwarded": bool(relay.get("forwarded")), "choice": choice,
+                "target_answer": answer,
                 "note": (f"Your {choice} was passed to the {profile} session; its final answer will arrive here."
                          if answer.get("ok") else f"The {profile} session did not take the answer: {answer}")}
 
@@ -939,7 +955,7 @@ SCHEMA = {
 
 
 def register(ctx: Any) -> None:
-    missing = check_internals()
+    missing = check_internals(ctx)
     if missing:
         logger.error("profile-tasks: Hermes internals missing after an update; the %s tool will refuse every "
                      "call until the plugin is fixed: %s", TOOL_NAME, "; ".join(missing))

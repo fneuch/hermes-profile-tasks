@@ -45,12 +45,16 @@ profile served by the same Hermes gateway.
   when the manager turn calls `approval` (a plugin cannot open an approval prompt in a conversation
   with no running turn); its card title is the generic plugin rule, the target command is in its
   description; it uses the manager profile's approval timeout, and if the manager's approvals are
-  bypassed (yolo or mode off) nothing is passed on and the target request stays pending.
+  bypassed (yolo or mode off) nothing is passed on and the target request stays pending. If the
+  target request ends (expired, answered in the target session, turn interrupted) while the card is
+  open, the card is withdrawn and the manager is told the real ending; an answer that reaches the
+  plugin after that ending is not recorded as pending.
   After the wait limit the plugin keeps watching the target turn (up to 24 h) only to relay approvals.
 - Targets: every profile the gateway serves (`gateway_state.json` `served_profiles`) except the caller.
 - The target runs with its own config, MCP servers and tokens. The manager only gets text back.
-- At load time the plugin checks the Hermes internals it uses. If an update removed one, it logs
-  an error naming it and the tool refuses every call with that message.
+- At load time the plugin checks the Hermes internals it uses, including the plugin context's
+  `_manager`. If an update removed one, it logs an error naming it and the tool refuses every call
+  with that message.
 
 ## Enable (not done by this repo)
 
