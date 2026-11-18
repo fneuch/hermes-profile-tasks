@@ -59,10 +59,23 @@ profile served by the same Hermes gateway.
   notice in the manager conversation: task, profile, server, and the command that fixes it
   (`hermes -p <profile> mcp login <server>`). A target tool result carrying `needs_reauth: true`
   (`tool.complete`) gets the same notice. One notice per server per task; it goes through the
-  notice queue above. A server parked by Hermes after repeated auth failures shows no tools but no
-  failed status, so it is only noticed through a tool result. Limit: this Hermes reports a 401 on
-  a tool call as a generic `MCPError` without `needs_reauth`, so a server that connected and then
-  loses its sign-in mid-turn is noticed only at the next state read if it then fails to connect.
+  notice queue above.
+- A 401 on an MCP tool call mid-task: this Hermes returns a generic `MCPError: Server returned an
+  error response` without `needs_reauth`, but records the HTTP status on the connection
+  (`_http_rejection`). On a failed `tool.complete` of an `mcp__<server>__*` tool, the plugin maps
+  the tool to its server (Hermes' tool-to-server map, else the target profile's server names) and
+  sends the notice when that connection's last HTTP error is a 401, or, for a remote server, when
+  the error text says 401 / unauthorized / invalid token. A stdio server's error text is not
+  trusted: it may relay its own API's 401.
+- A server Hermes set aside: after 3 failed calls Hermes opens a circuit breaker and refuses that
+  server's calls for 60 s, while `session.info` still shows it `connected` with no `needs_auth`.
+  A server whose reconnects are exhausted is parked (`failed` in `session.info`). At each state
+  read the plugin also reads the target profile's connections in the gateway process and sends
+  the notice for one whose breaker is open or that is parked, when its last HTTP error is a 401.
+  A breaker opened by other errors (500, timeouts) gets no notice.
+- These two checks read Hermes internals (`tools.mcp_tool._servers`, `_http_rejection`,
+  `_server_error_counts`, `_server_breaker_opened_at`, `_mcp_tool_server_names`). If they change,
+  the check logs a warning and the task goes on; it does not fail the load check.
 - Targets: every profile the gateway serves (`gateway_state.json` `served_profiles`) except the caller.
 - The target runs with its own config, MCP servers and tokens. The manager only gets text back.
 - At load time the plugin checks the Hermes internals it uses, including the plugin context's
@@ -100,7 +113,9 @@ only read (code and interpreter).
 
 - `PT_SCRIPT=tests/test_load_check.py e2e/run.sh`: load-time check, with all internals and with one removed.
 - `PT_SCRIPT=tests/test_mcp_reauth.py e2e/run.sh`: the `needs_reauth` tool-result notice (one per
-  server and task, kept when the manager conversation refuses it, approvals unaffected).
+  server and task, kept when the manager conversation refuses it, approvals unaffected), the
+  generic-error 401 mapping (no notice for a 500, a stdio server, a non-MCP tool), and the
+  set-aside reading (breaker open or parked after a 401; not after a 500 or past the cooldown).
 - `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets restart followup
   retry mcp_auth approval`; `approval` runs last because its relayed `always` permanently allows recursive
   delete in the isolated analyst profile). Evidence is written to `e2e/evidence/run-<timestamp>.json`. The analyst profile gets
@@ -109,7 +124,9 @@ only read (code and interpreter).
   like the live one: an enabled fixture server named `notion` and a disabled `atlassian` entry. The
   implementer profile gets two remote (HTTP) MCP servers that need a new sign-in: `jira` answers
   401 to every request, `linear` (the Hermes HTTP fixture) connects but answers 401 to every tool
-  call; trial `mcp_auth` checks the notices they produce.
+  call. Trial `mcp_auth` checks the notices they produce: `jira` at task start, `linear` on its
+  first 401 mid-task, nothing more for two more 401s in a second turn, then `linear` again for a
+  new task that calls nothing, because Hermes' breaker is open.
 
 `e2e/run.sh` stops the isolated gateway on every exit (end, failure, Ctrl-C, TERM) through that
 home's own control socket (`e2e/stop_gateway.py HERMES_HOME`, which refuses the real `~/.hermes`).

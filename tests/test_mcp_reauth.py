@@ -123,6 +123,60 @@ def main() -> int:
           "with an approval pending, the tool result still ends the approval and also notices the server",
           last_approval=task.get("last_approval"), noticed=task.get("mcp_auth_noticed"))
 
+    # A 401 Hermes folds into a generic MCPError: mapped through the target profile's own connections.
+    from tools import mcp_tool as core
+
+    class Conn:
+        def __init__(self, http: bool, status: int | None = None):
+            self.http, self._http_rejection = http, ({"status": status} if status else {})
+            self.session, self._park_reason = object(), None
+
+        def _is_http(self):
+            return self.http
+
+    home = str(plugin._home("implementer"))
+    conns = {"linear": Conn(True, 401), "jira": Conn(True), "gh": Conn(False), "slack": Conn(True, 500)}
+    with core._lock:
+        for name, conn in conns.items():
+            core._servers[(home, name)] = conn
+    generic = {"error": "MCP call failed: MCPError: Server returned an error response"}
+    plugin.store.update("t-d", task_id="t-d", profile="implementer", session_id="s-d", caller_session_key=key,
+                        status="running", turns=["a"], created_at=time.time())
+    before = len(ctx.injected)
+    plugin._on_target_frame("t-d", frame("s-d", json.dumps(generic)))
+    plugin._on_target_frame("t-d", frame("s-d", generic))
+    check(len(ctx.injected) == before + 1 and "a tool call failed with HTTP 401" in ctx.injected[-1][0]
+          and "hermes -p implementer mcp login linear" in ctx.injected[-1][0],
+          "a generic MCPError from mcp__linear__* whose connection last got a 401 gives one notice",
+          injected=ctx.injected[before:])
+    plugin._on_target_frame("t-d", frame("s-d", generic, name="mcp__slack__post"))
+    plugin._on_target_frame("t-d", frame("s-d", {"error": "GitHub API 401 Unauthorized"}, name="mcp__gh__list"))
+    plugin._on_target_frame("t-d", frame("s-d", {"error": "boom"}, name="mcp__jira__search"))
+    plugin._on_target_frame("t-d", frame("s-d", {"ok": True}, name="mcp__jira__search"))
+    plugin._on_target_frame("t-d", frame("s-d", {"error": "HTTP 401"}, name="terminal"))
+    check(len(ctx.injected) == before + 1, "no notice for a 500, a stdio server relaying its API's 401, an error "
+          "without a 401, a success, or a non-MCP tool", injected=ctx.injected[before + 1:])
+    plugin._on_target_frame("t-d", frame("s-d", {"error": "HTTP 401 Unauthorized: invalid_token"},
+                                         name="mcp__jira__search"))
+    check(len(ctx.injected) == before + 2 and "mcp login jira" in ctx.injected[-1][0],
+          "a remote server whose error text says 401/unauthorized gives a notice",
+          injected=ctx.injected[before + 1:])
+
+    # Set aside: an open breaker after 401s, or a park; a breaker without a 401 is not an auth problem.
+    key_l, key_s = (home, "linear"), (home, "slack")
+    core._server_error_counts[key_l] = core._server_error_counts[key_s] = 3
+    core._server_breaker_opened_at[key_l] = core._server_breaker_opened_at[key_s] = time.monotonic()
+    parked = Conn(True, 401)
+    parked.session, parked._park_reason = None, "after reconnect retries exhausted"
+    check(bool(mod._mcp_set_aside(key_l, conns["linear"])) and "paused it after 3" in
+          mod._mcp_set_aside(key_l, conns["linear"]) and mod._mcp_set_aside(key_s, conns["slack"]) is None
+          and "set it aside (after reconnect retries exhausted)" in (mod._mcp_set_aside((home, "p"), parked) or ""),
+          "an open breaker or a park after a 401 is reported; a breaker opened by 500s is not",
+          linear=mod._mcp_set_aside(key_l, conns["linear"]), parked=mod._mcp_set_aside((home, "p"), parked))
+    core._server_breaker_opened_at[key_l] = time.monotonic() - core._CIRCUIT_BREAKER_COOLDOWN_SEC - 1
+    check(mod._mcp_set_aside(key_l, conns["linear"]) is None, "a breaker past its cooldown (half-open) is not "
+          "reported")
+
     print("failures:", failures)
     return 1 if failures else 0
 

@@ -328,8 +328,56 @@ def _reauth_server(payload: dict) -> str | None:
     return None
 
 
+_AUTH_TEXT = re.compile(r"\b401\b|unauthori[sz]ed|re-?authenticat|invalid[_ ]token|authentication (failed|required)",
+                        re.IGNORECASE)
+
+
+def _mcp_tool_error_text(payload: dict) -> str:
+    """The error text of a failed tool.complete result, or "" when the call did not fail."""
+    result = payload.get("result")
+    if isinstance(result, str) and result.startswith("{"):
+        with contextlib.suppress(ValueError):
+            result = json.loads(result)
+    if isinstance(result, dict):
+        return str(result.get("error") or "")
+    return str(result or "") if payload.get("is_error") else ""
+
+
+def _mcp_runtime(profile_home: Path) -> dict[str, Any]:
+    """The target profile's MCP connections in this process, by server name (keys are ``(profile home, name)``)."""
+    from tools import mcp_tool as core
+    home = profile_home.resolve()
+    with core._lock:
+        items = list(core._servers.items())
+    return {key[1]: (key, server) for key, server in items
+            if isinstance(key, tuple) and len(key) == 2 and Path(str(key[0])).resolve() == home}
+
+
+def _mcp_rejected_auth(server: Any) -> bool:
+    """Whether the last HTTP error this connection received is a 401 (``_http_rejection``, recorded by Hermes
+    because the MCP SDK folds it into a generic MCPError)."""
+    return (getattr(server, "_http_rejection", None) or {}).get("status") == 401
+
+
+def _mcp_set_aside(key: Any, server: Any) -> str | None:
+    """Why Hermes stopped using a connection whose last HTTP error is a 401, or None: an open circuit breaker
+    (status stays "connected"), or a park (no live session)."""
+    from tools import mcp_tool as core
+    if not _mcp_rejected_auth(server):
+        return None
+    failures = core._server_error_counts.get(key, 0)
+    opened = core._server_breaker_opened_at.get(key)
+    if (failures >= core._CIRCUIT_BREAKER_THRESHOLD and opened is not None
+            and time.monotonic() - opened < core._CIRCUIT_BREAKER_COOLDOWN_SEC):
+        return (f"Hermes paused it after {failures} consecutive failed calls, the last one an HTTP 401 "
+                f"(unauthorized)")
+    if getattr(server, "session", None) is None and getattr(server, "_park_reason", None):
+        return f"Hermes set it aside ({server._park_reason}) after an HTTP 401 (unauthorized)"
+    return None
+
+
 def _mcp_auth_problem(row: dict) -> str | None:
-    """Why a ``session.info`` ``mcp_servers`` row may need a new sign-in, or None (a parked server simply has no tools)."""
+    """Why a ``session.info`` ``mcp_servers`` row may need a new sign-in, or None."""
     if row.get("needs_auth"):
         return "its sign-in was rejected"
     if row.get("transport") != "stdio" and row.get("status") == "failed":
@@ -573,6 +621,8 @@ class ProfileTasks:
         kind = frame.get("type")
         if kind == "tool.complete" and (server := _reauth_server(payload)):
             self._mcp_auth_notice(task_id, server, "a tool call was refused: the server requires re-authentication")
+        elif kind == "tool.complete" and str(payload.get("name") or "").startswith("mcp__"):
+            self._check_mcp_tool_failure(task_id, task, payload)
         if kind == "approval.request" and payload.get("prompt_id"):
             self._approval_raised(task_id, payload)
         elif kind == "approval.settled" and payload.get("prompt_id"):
@@ -665,6 +715,41 @@ class ProfileTasks:
             why = _mcp_auth_problem(row)
             if why and row.get("name"):
                 self._mcp_auth_notice(task_id, str(row["name"]), why)
+        try:
+            runtime = _mcp_runtime(self._home(task["profile"]))
+            set_aside = [(name, why) for name, (key, server) in runtime.items() if (why := _mcp_set_aside(key, server))]
+        except Exception:  # noqa: BLE001 - Hermes internals; the check must not end the task
+            logger.warning("profile-tasks: MCP runtime state of %s could not be read", task.get("profile"),
+                           exc_info=True)
+            return
+        for name, why in set_aside:
+            self._mcp_auth_notice(task_id, name, why)
+
+    def _check_mcp_tool_failure(self, task_id: str, task: dict, payload: dict) -> None:
+        """A failed MCP tool call (mcp__<server>__*) whose server's last HTTP error is a 401, or whose error text
+        says so, gets the re-authentication notice."""
+        error = _mcp_tool_error_text(payload)
+        if not error:
+            return
+        name = str(payload["name"])
+        try:
+            from tools.mcp_tool import _mcp_tool_server_names
+            from tools.mcp_tool_schema import sanitize_mcp_name_component
+            runtime = _mcp_runtime(self._home(task["profile"]))
+            server = _mcp_tool_server_names.get(name)
+            if server not in runtime:
+                # The generated name is lossy; match it against this profile's own servers.
+                server = next((s for s in sorted(runtime, key=len, reverse=True)
+                               if name.startswith(f"mcp__{sanitize_mcp_name_component(s)}__")), server)
+            connection = runtime[server][1] if server in runtime else None
+            rejected = connection is not None and _mcp_rejected_auth(connection)
+            # Error text alone counts for a remote server only: a stdio server relays its own API's errors.
+            remote = connection is not None and callable(getattr(connection, "_is_http", None)) and connection._is_http()
+        except Exception:  # noqa: BLE001 - Hermes internals; the check must not end the task
+            logger.warning("profile-tasks: MCP tool failure of %s could not be mapped", name, exc_info=True)
+            return
+        if rejected or (remote and _AUTH_TEXT.search(error)):
+            self._mcp_auth_notice(task_id, server, "a tool call failed with HTTP 401 (unauthorized)")
 
     def _mcp_auth_notice(self, task_id: str, server: str, why: str) -> None:
         """One notice per server and task: which profile, which server, and the command that signs in again."""

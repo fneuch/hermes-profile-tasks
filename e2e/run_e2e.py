@@ -144,8 +144,9 @@ def analyst_model(record: dict):
             return ToolCall("terminal", {"command": f"rm -rf {HOME}/{tag.lower()}-probe-dir"})
         return Text(f"{tag}-RESULT {text_of(tool_results[-1])[:400]}", reasoning=reasoning)
     if tag.startswith("REAUTH"):
-        if not tool_results:
-            return ToolCall(REAUTH_TOOL, {"nonce": tag.lower()})
+        # REAUTH: one call; REAUTHAGAIN: two more, which opens Hermes' circuit breaker (3 failures).
+        if len(tool_results) < (2 if tag == "REAUTHAGAIN" else 1):
+            return ToolCall(REAUTH_TOOL, {"nonce": f"{tag.lower()}-{len(tool_results)}"})
         return Text(f"{tag}-RESULT {text_of(tool_results[-1])[:300]}", reasoning=reasoning)
     if tag == "SLOW":
         time.sleep(WAIT_LIMIT + 15)
@@ -977,11 +978,14 @@ async def trial_mcp_auth(ctx) -> None:
         call = manager_saw(ctx["m"], f"MCP server '{CALL_SERVER}' of the implementer")
         served_401 = [line for line in Path(EVIDENCE["remote_mcp"]["inbound_log"]).read_text().splitlines()
                       if "injected_401_for" in line]
-        # This Hermes folds a tools/call 401 into a generic MCPError (upstream #121285): no needs_reauth.
-        check("mcp_auth", bool(served_401) and bool(completes) and (bool(refused) == bool(call)),
-              "hook (b), real path: a 401 on tools/call from the implementer's remote server; the manager gets a "
-              "notice exactly when the tool result carries needs_reauth (this Hermes does not set it for a 401; "
-              "the frame handling is proven by tests/test_mcp_reauth.py)",
+        # This Hermes folds a tools/call 401 into a generic MCPError (upstream #121285): no needs_reauth, so the
+        # plugin maps mcp__linear__* to its connection and reads the 401 Hermes recorded (_http_rejection).
+        # The viewer may resume after the first call finished; the second turn's results are checked below.
+        check("mcp_auth", bool(served_401) and not refused and bool(call)
+              and f"Task {task_id}" in call and "a tool call failed with HTTP 401" in call
+              and f"hermes -p implementer mcp login {CALL_SERVER}" in call,
+              "gap 1: a 401 on tools/call mid-task (generic MCPError, no needs_reauth) sends the manager one notice "
+              "naming the server and the login command",
               server_answered_401=len(served_401), tool_results=results, needs_reauth_results=refused, notice=call)
         first = mcp_auth_notices(task_id)
         await call_tool(ctx, mgr, sid, {"action": "follow_up", "task_id": task_id,
@@ -990,15 +994,37 @@ async def trial_mcp_auth(ctx) -> None:
         await asyncio.sleep(3)
         again = mcp_auth_notices(task_id)
         texts = [n.get("text") or "" for n in again]
-        expected = sorted([LOGIN_SERVER] + ([CALL_SERVER] if refused else []))
-        check("mcp_auth", len(first) == len(expected) and len(again) == len(expected)
+        expected = sorted([LOGIN_SERVER, CALL_SERVER])
+        second_results = [(f.get("payload") or {}).get("result") for f in viewer.frames
+                          if f.get("type") == "tool.complete"][len(results):]
+        check("mcp_auth", len(first) == len(expected) and len(again) == len(expected) and len(second_results) == 2
+              and not any("needs_reauth" in str(x) for x in second_results)
               and not plugin_task(task_id).get("outbox")
               and sorted(plugin_task(task_id).get("mcp_auth_noticed") or []) == expected,
               "one notice per server per task: the server state is read at the start and end of each turn, and a "
-              "second turn of the task hitting the same servers adds none; every notice was taken by the manager "
-              "conversation",
+              "second turn of the task hitting the same servers (two more 401s, generic MCPError) adds none; every "
+              "notice was taken by the manager conversation",
               notices_after_first_turn=[n["id"] for n in first], notices_after_second_turn=[n["id"] for n in again],
-              kept=texts if plugin_task(task_id).get("outbox") else [], noticed=expected)
+              kept=texts if plugin_task(task_id).get("outbox") else [], noticed=expected,
+              second_turn_tool_results=second_results)
+        # Gap 2: three failed calls opened the breaker. Hermes now refuses linear's calls while session.info
+        # still shows it "connected"; a new task that calls nothing must still be told.
+        rows = {r.get("name"): r for r in (await viewer.rpc("session.info", session_id=isid)).get("mcp_servers") or []}
+        ack2 = await start_task(ctx, mgr, sid, "PLAIN", "after the breaker", profile="implementer")
+        task2 = ack2["task_id"]
+        await until(lambda: manager_got(ctx["m"], f"Answer from implementer for task {task2}"), 120, "plain answer")
+        paused = await until(lambda: manager_saw(ctx["m"], f"Task {task2} (implementer): the MCP server "
+                                                          f"'{CALL_SERVER}'"), 30, "set-aside notice")
+        check("mcp_auth", (rows.get(CALL_SERVER) or {}).get("status") == "connected"
+              and "paused it after" in paused and "HTTP 401" in paused
+              and f"hermes -p implementer mcp login {CALL_SERVER}" in paused
+              and not plugin_task(task2).get("outbox")
+              and (plugin_task(task2).get("mcp_auth_noticed") or []).count(CALL_SERVER) == 1
+              and len(mcp_auth_notices(task2)) == len(plugin_task(task2).get("mcp_auth_noticed") or []),
+              "gap 2: a server Hermes set aside after repeated 401s (circuit breaker open, session.info still "
+              "\"connected\", no needs_auth) is reported to the manager for a task that made no call to it",
+              session_info_row=rows.get(CALL_SERVER), notice=paused, task=task2,
+              noticed=plugin_task(task2).get("mcp_auth_noticed"))
     analyst_tasks = [t for t in json.loads(next((HH / "plugin-data").glob("*/state.json")).read_text())["tasks"].values()
                      if t.get("profile") == "analyst"]
     check("mcp_auth", not any(t.get("mcp_auth_noticed") for t in analyst_tasks),
