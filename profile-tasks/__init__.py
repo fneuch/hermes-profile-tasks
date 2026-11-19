@@ -4,6 +4,9 @@ Each task is one session created under the target profile the way the desktop cr
 (``session.create`` with ``source="gui"``), then the text is submitted with ``prompt.submit``.
 The target runs with its own config, MCP servers and tokens; only its final text comes back,
 injected once into the calling conversation.
+
+A plugin backend with no calling conversation uses the module functions ``send`` and ``result``
+instead: one task (one visible session) per caller-chosen key, its answer kept for ``result``.
 """
 
 from __future__ import annotations
@@ -420,6 +423,7 @@ class ProfileTasks:
         self._relay_lock = threading.Lock()
         self._outbox_lock = threading.Lock()
         self._send_lock = threading.Lock()
+        self._key_lock = threading.Lock()
 
     def _gateway_host(self) -> bool:
         """True once this process runs a gateway that accepts plugin messages."""
@@ -483,23 +487,63 @@ class ProfileTasks:
 
     # actions
     def start(self, profile: str, text: str, title: str | None) -> dict:
+        self._check_new(profile, text)
+        from gateway.session_context import bound_session_key
+        caller_key = bound_session_key()
+        if not caller_key:
+            raise ValueError("no calling conversation to deliver the answer to")
+        return self._send(self._new_task(profile, title, caller_key), text, create=True)
+
+    def _check_new(self, profile: str, text: str) -> None:
         targets = self.targets()
         if profile not in targets:
             raise ValueError(f"profile must be one of {targets}")
         if not text.strip():
             raise ValueError("text is required")
-        from gateway.session_context import bound_session_key
-        caller_key = bound_session_key()
-        if not caller_key:
-            raise ValueError("no calling conversation to deliver the answer to")
+
+    def _new_task(self, profile: str, title: str | None, caller_key: str | None, key: str | None = None) -> str:
         task_id = "t-" + uuid.uuid4().hex[:8]
         label = f"Task {task_id}" + (f": {title.strip()[:80]}" if title and title.strip() else "")
         self.store.update(task_id, task_id=task_id, profile=profile, caller_session_key=caller_key,
                           title=label, created_at=time.time(), status="starting", session_id=None, turns=[],
-                          waiter=_process_token(os.getpid()))
-        return self._send(task_id, text, create=True)
+                          waiter=_process_token(os.getpid()), **({"key": key} if key else {}))
+        return task_id
 
-    def follow_up(self, task_id: str, text: str) -> dict:
+    # programmatic surface: a keyed task has no calling conversation; its caller reads it with result()
+    def task_for_key(self, key: str) -> dict | None:
+        """The latest task started under *key*, or None."""
+        tasks = [t for t in self.store.all().values() if t.get("key") == key]
+        return max(tasks, key=lambda t: t.get("created_at") or 0) if tasks else None
+
+    def send_keyed(self, key: str, profile: str, text: str, title: str | None = None) -> dict:
+        """Start *key*'s task in *profile*, or send *text* as a follow-up in that task's session."""
+        key = (key or "").strip()
+        if not key:
+            raise ValueError("key is required")
+        with self._key_lock:
+            task = self.task_for_key(key)
+            # A task that never got a session cannot take a follow-up: the key starts a new one.
+            if task is None or (not task.get("session_id") and not self._running_turn(task)):
+                self._check_new(profile, text)
+                task_id, create = self._new_task(profile, title, None, key), True
+            elif profile != task["profile"]:
+                raise ValueError(f"key {key} belongs to profile {task['profile']}, not {profile}")
+            else:
+                task_id, create = task["task_id"], False
+        sent = self._send(task_id, text, create=True) if create else self.follow_up(task_id, text, keyed=True)
+        sent.pop("note", None)
+        return {"key": key, **sent}
+
+    def keyed_result(self, key: str) -> dict:
+        """The state of *key*'s task and, once its last turn answered, that final answer."""
+        task = self.task_for_key((key or "").strip())
+        if task is None:
+            raise ValueError(f"unknown key {key}")
+        row = self.status(task["task_id"])["tasks"][0]
+        keep = ("task_id", "profile", "status", "session_id", "link", "answer", "error", "pending_approval")
+        return {"key": task["key"], **{k: row[k] for k in keep if row.get(k) is not None}}
+
+    def follow_up(self, task_id: str, text: str, *, keyed: bool = False) -> dict:
         task = self.store.get(task_id)
         if task is None:
             raise ValueError(f"unknown task {task_id}")
@@ -515,9 +559,14 @@ class ProfileTasks:
                     f"task {task_id} has a turn running in {task['profile']} ({running}). A follow_up now would "
                     f"start a second turn on the same task. Use action=correct to change the running turn, or "
                     f"send the follow_up after its answer arrives.")
-            caller_key = bound_session_key() or task["caller_session_key"]
-            self.store.update(task_id, caller_session_key=caller_key, status="starting",
-                              waiter=_process_token(os.getpid()))
+            if keyed:
+                # The previous turn's answer must not pass for this turn's in result().
+                self.store.update(task_id, status="starting", last_answer=None, error=None,
+                                  waiter=_process_token(os.getpid()))
+            else:
+                caller_key = bound_session_key() or task["caller_session_key"]
+                self.store.update(task_id, caller_session_key=caller_key, status="starting",
+                                  waiter=_process_token(os.getpid()))
         return self._send(task_id, text, create=False)
 
     def _running_turn(self, task: dict) -> str | None:
@@ -884,6 +933,12 @@ class ProfileTasks:
     # notices to the calling conversation: kept in the task until that conversation takes them
     def _notify(self, task_id: str, message: str, kind: str, trigger: str = "event") -> bool:
         """Queue *message* for the task's calling conversation and try to hand over the queue in order."""
+        if (self.store.get(task_id) or {}).get("key"):
+            # A keyed task has no calling conversation: the notice is only recorded, never injected.
+            entry = _notice(message, kind) | {"delivered_at": None, "trigger": trigger}
+            with self._outbox_lock:
+                self.store.modify(task_id, lambda task: {"notices": list(task.get("notices") or []) + [entry]})
+            return True
         self._queue_only(task_id, message, kind)
         return self._flush_task(task_id, trigger)
 
@@ -896,6 +951,11 @@ class ProfileTasks:
         """Inject the task's queued notices oldest first; stop at the first refusal. True when none is left."""
         with self._outbox_lock:
             task = self.store.get(task_id) or {}
+            if task.get("key"):
+                # Queued by a restart: a keyed task's notices are recorded, never injected.
+                return not self.store.modify(task_id, lambda current: {
+                    "outbox": [], "notices": list(current.get("notices") or [])
+                    + [e | {"delivered_at": None, "trigger": trigger} for e in current.get("outbox") or []]})["outbox"]
             outbox = list(task.get("outbox") or [])
             sent: list[dict] = []
             refused: dict | None = None
@@ -1051,6 +1111,9 @@ class ProfileTasks:
             if task_id not in tasks:
                 raise ValueError(f"unknown task {task_id}")
             tasks = {task_id: tasks[task_id]}
+        else:
+            # Keyed tasks belong to their plugin caller, not to the tool's task list.
+            tasks = {tid: t for tid, t in tasks.items() if not t.get("key")}
         extra: dict[str, dict] = {}
         for tid, task in tasks.items():
             if not _waiter_alive(task.get("waiter")) and (task.get("pending_approval")
@@ -1170,12 +1233,54 @@ SCHEMA = {
 }
 
 
+# The plugin registered in this process; send() and result() go through it.
+_PLUGIN: ProfileTasks | None = None
+
+
+def _loaded() -> ProfileTasks:
+    if _PLUGIN is None:
+        raise RuntimeError("profile-tasks is not loaded in this process")
+    if _PLUGIN.missing:
+        raise RuntimeError("profile_task is unavailable: this Hermes no longer has the internals it depends on: "
+                           + "; ".join(_PLUGIN.missing))
+    return _PLUGIN
+
+
+def send(key: str, profile: str, text: str, title: str | None = None) -> dict:
+    """Send *text* to *profile* in the session of *key*, for a caller with no conversation (a plugin backend).
+
+    The first call for a key creates its task and session (visible in the chat list); later calls are follow-ups
+    in that same session. Returns once the target accepted the text (up to 120 s; run it off the event loop):
+    ``key``, ``task_id``, ``accepted`` and, when accepted, ``session_id``, ``session_title`` and ``link``.
+    Raises ValueError for a refused call: unknown profile, empty text, another profile for the key, or a turn
+    of the key still running. Nothing is injected into any conversation; read the answer with ``result``.
+    """
+    return _loaded().send_keyed(key, profile, text, title)
+
+
+def result(key: str, wait: float = 0.0) -> dict:
+    """The state of *key*'s task: ``status`` (``starting``/``running`` while its turn runs, then ``answered``,
+    ``failed``, ``waiting_timeout`` or ``wait_lost``), ``answer`` (the last turn's final text, once answered),
+    ``error``, ``pending_approval``, ``task_id``, ``session_id``, ``link``. With *wait*, blocks up to that many
+    seconds while the turn runs. Raises ValueError for an unknown key.
+    """
+    plugin = _loaded()
+    deadline = time.monotonic() + max(0.0, float(wait))
+    while True:
+        row = plugin.keyed_result(key)
+        remaining = deadline - time.monotonic()
+        if row.get("status") not in WAITING or remaining <= 0:
+            return row
+        time.sleep(min(1.0, remaining))
+
+
 def register(ctx: Any) -> None:
+    global _PLUGIN
     missing = check_internals(ctx)
     if missing:
         logger.error("profile-tasks: Hermes internals missing after an update; the %s tool will refuse every "
                      "call until the plugin is fixed: %s", TOOL_NAME, "; ".join(missing))
-    plugin = ProfileTasks(ctx, missing)
+    plugin = _PLUGIN = ProfileTasks(ctx, missing)
     if not missing:
         recovered = plugin.recover_after_restart()
         if recovered:

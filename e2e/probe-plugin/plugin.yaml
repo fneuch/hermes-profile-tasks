@@ -1,0 +1,3 @@
+name: pt-probe
+version: "0.1.0"
+description: e2e only. Calls profile_tasks.send and result from a gateway thread with no conversation.

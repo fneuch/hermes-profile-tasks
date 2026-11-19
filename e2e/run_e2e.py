@@ -114,6 +114,9 @@ def analyst_model(record: dict):
         if not tool_results:
             return ToolCall(MCP_TOOL, {"nonce": "jira-read"})
         return Text(f"MCP-RESULT {text_of(tool_results[-1])}", reasoning=reasoning)
+    if tag.startswith("KEYED"):
+        turns = sum(1 for m in messages if m.get("role") == "user" and "SCENARIO:KEYED" in text_of(m))
+        return Text(f"KEYED-ANSWER {tag} user_turns={turns}", reasoning=reasoning)
     if tag.startswith("REMEMBER"):
         return Text(f"REMEMBERED {tag}", reasoning=reasoning)
     if tag == "RECALL":
@@ -183,7 +186,7 @@ def write_home(manager_url: str, analyst_url: str, remote: dict[str, str]) -> No
 
     # Like the live default profile: enabled servers of its own, and a disabled `atlassian` entry.
     default = dict(common, model=model(manager_url), gateway={"multiplex_profiles": True}, plugins={
-        "enabled": ["profile-tasks"],
+        "enabled": ["profile-tasks", "pt-probe"],
         "entries": {"profile-tasks": {"allow_gateway_injection": True,
                                       "settings": {"wait_timeout_seconds": WAIT_LIMIT}}},
     }, mcp_servers={"notion": fixture_mcp(MANAGER_CANARY), "atlassian": fixture_mcp(MANAGER_CANARY, enabled=False)})
@@ -201,6 +204,7 @@ def write_home(manager_url: str, analyst_url: str, remote: dict[str, str]) -> No
         (homes[name] / ".env").write_text("OPENAI_API_KEY=sk-fake-e2e\n", encoding="utf-8")
     (HH / "plugins").mkdir(exist_ok=True)
     (HH / "plugins/profile-tasks").symlink_to(REPO / "profile-tasks")
+    (HH / "plugins/pt-probe").symlink_to(REPO / "e2e/probe-plugin")
     EVIDENCE["configs"] = {"default": default, "analyst": analyst, "implementer": implementer}
 
 
@@ -749,6 +753,59 @@ async def trial_8(ctx) -> None:
         check("8", any(r[1] for r in stored2), "an unwatched task session stores its reasoning too", stored=stored2)
 
 
+async def probe(op: str, **args) -> dict:
+    """Run profile_tasks.<op>(**args) in a gateway thread that has no conversation (the pt-probe plugin)."""
+    box = HH / "pt-probe"
+    box.mkdir(exist_ok=True)
+    name = uuid.uuid4().hex[:8]
+    (box / f".{name}").write_text(json.dumps({"op": op, "args": args}))
+    (box / f".{name}").rename(box / f"request-{name}.json")
+    response = box / f"response-{name}.json"
+    await until(response.exists, 180, f"probe {op}")
+    out = json.loads(response.read_text())
+    EVIDENCE.setdefault("probe_calls", []).append({"t": time.strftime("%H:%M:%S"), "op": op, "args": args,
+                                                   **{k: v for k, v in out.items() if k != "trace"}})
+    if not out["ok"]:
+        raise RuntimeError(f"probe {op}: {out['error']}\n{out.get('trace', '')}")
+    return out["value"]
+
+
+async def trial_keyed(ctx) -> None:
+    """send/result from a plugin backend: one session per key, follow-ups reuse it, the answer is returned."""
+    a, b = "desk-pr-" + uuid.uuid4().hex[:6], "desk-pr-" + uuid.uuid4().hex[:6]
+    before = len(ctx["m"].main_requests())
+    first = await probe("send", key=a, profile="analyst", text="SCENARIO:KEYEDA1 first question", title="PR A")
+    second = await probe("send", key=b, profile="analyst", text="SCENARIO:KEYEDB1 other question", title="PR B")
+    check("keyed", first.get("accepted") is True and second.get("accepted") is True
+          and first["session_id"] != second["session_id"] and "note" not in first,
+          "two keys from a caller with no conversation start two tasks in two analyst sessions",
+          first=first, second=second)
+    answer_a = await probe("result", key=a, wait=90)
+    answer_b = await probe("result", key=b, wait=90)
+    check("keyed", answer_a.get("status") == "answered" and answer_a.get("answer", "").startswith(
+          "KEYED-ANSWER KEYEDA1") and answer_b.get("answer", "").startswith("KEYED-ANSWER KEYEDB1"),
+          "result returns each key's final answer and status", result_a=answer_a, result_b=answer_b)
+    follow = await probe("send", key=a, profile="analyst", text="SCENARIO:KEYEDA2 follow-up")
+    answer_a2 = await probe("result", key=a, wait=90)
+    sessions = analyst_db("SELECT id, title, source FROM sessions WHERE id IN (?, ?)",
+                          (first["session_id"], second["session_id"]))
+    check("keyed", follow.get("task_id") == first["task_id"] and follow.get("session_id") == first["session_id"]
+          and answer_a2.get("answer") == "KEYED-ANSWER KEYEDA2 user_turns=2" and len(sessions) == 2,
+          "a second send on the first key is a follow-up in its session, with the first turn as context",
+          follow=follow, result=answer_a2, analyst_sessions=sessions)
+    async with Client("analyst") as viewer:
+        listed = await viewer.rpc("session.list")
+    rows = listed.get("sessions") if isinstance(listed, dict) else listed
+    ids = {r.get("id") for r in rows or []}
+    check("keyed", {first["session_id"], second["session_id"]} <= ids,
+          "both key sessions are in the analyst profile's default session list (visible, not hidden)",
+          listed=[r for r in rows or [] if r.get("id") in (first["session_id"], second["session_id"])])
+    injected = manager_saw(ctx["m"], "KEYED-ANSWER")
+    check("keyed", not injected and len(ctx["m"].main_requests()) == before,
+          "nothing reached a manager conversation: no injection, no manager turn",
+          manager_requests_during_trial=len(ctx["m"].main_requests()) - before)
+
+
 async def trial_9(ctx) -> None:
     ack = ctx.get("task1") or {}
     check("9", False, "NOT PROVEN: clicking the link needs the desktop app; the isolated run has no desktop",
@@ -1044,7 +1101,7 @@ async def trial_bad_target(ctx) -> None:
 
 TRIALS = {"1-2-3": trial_1_2_3, "4": trial_4, "5": trial_5, "6": trial_6, "7": trial_7, "8": trial_8,
           "9": trial_9, "limit": trial_timeout_status, "targets": trial_bad_target, "restart": trial_restart,
-          "followup": trial_followup, "retry": trial_notice_retry, "mcp_auth": trial_mcp_auth,
+          "followup": trial_followup, "retry": trial_notice_retry, "mcp_auth": trial_mcp_auth, "keyed": trial_keyed,
           # Last: its 'always' relay permanently allows recursive delete in the analyst profile.
           "approval": trial_approval}
 

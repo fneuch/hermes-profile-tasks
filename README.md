@@ -93,6 +93,26 @@ profile served by the same Hermes gateway.
   `_manager`. If an update removed one, it logs an error naming it and the tool refuses every call
   with that message.
 
+## From a plugin backend (no calling conversation)
+
+Code running in the gateway process (a dashboard plugin backend, for example) calls the module the
+gateway loaded, `sys.modules["hermes_plugins.profile_tasks"]`:
+
+- `send(key, profile, text, title=None)`: the first call for a key creates a task and its session in
+  `profile` (a normal session, listed in that profile's chat list); later calls on the same key are
+  follow-ups in that session. Returns once the target accepted the text (up to 120 s; call it off the
+  event loop): `key`, `task_id`, `accepted`, `session_id`, `session_title`, `link`. Raises
+  `ValueError` for an unknown profile, empty key or text, another profile than the key's, or a turn
+  of the key still running. A key whose task never got a session starts a new task.
+- `result(key, wait=0)`: `status` (`starting`/`running`, then `answered`, `failed`,
+  `waiting_timeout` or `wait_lost`), `answer` (the last turn's final text, once answered), `error`,
+  `pending_approval`, `task_id`, `session_id`, `link`. `wait` blocks up to that many seconds while
+  the turn runs. Past the wait limit or after a restart it reads the target turn, like `status`.
+
+Nothing is injected into any conversation for a keyed task: its notices (answer, approval, wait
+limit, restart) are only recorded on the task. Keyed tasks are left out of the tool's
+`action=status` list. Keys and tasks are kept in the plugin state like the tool's.
+
 ## Enable (not done by this repo)
 
 1. Link or copy `profile-tasks/` into the default profile's plugin folder:
@@ -128,8 +148,12 @@ only read (code and interpreter).
   generic-error 401 mapping (no notice for a 500, a stdio server, a non-MCP tool; no connection
   read for a server already noticed), the skipped session-scope connection key, and the
   set-aside reading (breaker open or parked after a 401; not after a 500 or past the cooldown).
+- `PT_SCRIPT=tests/test_keyed.py e2e/run.sh`: `send`/`result` by key with a fake target: one task and
+  session per key, follow-up in the same session, answer returned and injected nowhere, refused
+  calls, keyed tasks out of the tool's status list, a restart notice recorded only.
 - `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets restart followup
-  retry mcp_auth approval`; `approval` runs last because its relayed `always` permanently allows recursive
+  retry mcp_auth keyed approval`; `keyed` calls `send`/`result` from a gateway thread of the
+  `e2e/probe-plugin` plugin, with no conversation; `approval` runs last because its relayed `always` permanently allows recursive
   delete in the isolated analyst profile). Evidence is written to `e2e/evidence/run-<timestamp>.json`. The analyst profile gets
   a fixture MCP server named `atlassian` (from the Hermes test fixtures) whose answer carries a
   per-run token set only in the analyst config. The default (manager) profile gets MCP servers
