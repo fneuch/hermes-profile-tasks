@@ -11,10 +11,12 @@ Run: ``PT_SCRIPT=tests/test_mcp_reauth.py e2e/run.sh`` (isolated HOME/HERMES_HOM
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import logging
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -210,6 +212,70 @@ def main() -> int:
     core._server_breaker_opened_at[key_l] = time.monotonic() - core._CIRCUIT_BREAKER_COOLDOWN_SEC - 1
     check(mod._mcp_set_aside(key_l, conns["linear"]) is None, "a breaker past its cooldown (half-open) is not "
           "reported")
+
+    # A failed dict result without an "error" key: its body is the error text.
+    check(mod._mcp_tool_error_text({"is_error": True, "result": {"status": 401, "detail": "Unauthorized"}})
+          == '{"status": 401, "detail": "Unauthorized"}'
+          and mod._mcp_tool_error_text({"is_error": True, "result": '{"detail": "invalid_token"}'})
+          == '{"detail": "invalid_token"}'
+          and mod._mcp_tool_error_text({"is_error": False, "result": {"detail": "Unauthorized"}}) == "",
+          "a failed dict result without an error key maps to its JSON body; a successful one maps to nothing")
+    with core._lock:
+        core._servers[(home, "asana")] = Conn(True)
+    try:
+        plugin.store.update("t-e", task_id="t-e", profile="implementer", session_id="s-e", caller_session_key=key,
+                            status="running", turns=["a"], created_at=time.time())
+        before = len(ctx.injected)
+        plugin._on_target_frame("t-e", frame("s-e", {"status": 401, "detail": "Unauthorized"},
+                                             name="mcp__asana__tasks"))
+        check(len(ctx.injected) == before + 1 and "mcp login asana" in ctx.injected[-1][0],
+              "a remote server's failed result without an error key but saying 401 gives a notice",
+              injected=ctx.injected[before:])
+    finally:
+        with core._lock:
+            core._servers.pop((home, "asana"), None)
+
+    # Past the wait limit, the MCP states are read again once the approval watch ends.
+    class WaitConn:
+        def __init__(self, home_, on_frame=None):
+            self.infos, self.waits = 0, 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def rpc(self, method, **params):
+            if method == "prompt.submit":
+                return {"admission_id": "adm-w"}
+            if method == "session.info":
+                self.infos += 1
+                rows = [{"name": "linear", "needs_auth": True}] if self.infos > 1 else []
+                return {"mcp_servers": rows}
+            return {}
+
+        async def wait_terminal(self, session_id, admission_id, deadline):
+            self.waits += 1
+            if self.waits == 1:
+                raise TimeoutError
+            return {"status": "terminal"}
+
+    seen: list[WaitConn] = []
+    real_conn = mod._Connection
+    mod._Connection = lambda home_, on_frame=None: seen.append(WaitConn(home_, on_frame)) or seen[-1]
+    try:
+        plugin.store.update("t-w", task_id="t-w", profile="reviewer", session_id="s-w", caller_session_key=key,
+                            status="running", turns=[], created_at=time.time(), title="w")
+        before = len(ctx.injected)
+        asyncio.run(plugin._send_and_wait("t-w", "go", False, {}, threading.Event()))
+    finally:
+        mod._Connection = real_conn
+    texts = [t for t, _ in ctx.injected[before:]]
+    check(seen[0].infos == 2 and seen[0].waits == 2 and any("no answer within" in t for t in texts)
+          and any("hermes -p reviewer mcp login linear" in t for t in texts),
+          "on the wait-limit path the MCP states are read at the start and again after the approval watch",
+          infos=seen[0].infos, waits=seen[0].waits, injected=texts)
 
     print("failures:", failures)
     return 1 if failures else 0

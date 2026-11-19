@@ -53,8 +53,9 @@ profile served by the same Hermes gateway.
   open, the card is withdrawn and the manager is told the real ending; an answer that reaches the
   plugin after that ending is not recorded as pending nor sent to the target session.
   After the wait limit the plugin keeps watching the target turn (up to 24 h) only to relay approvals.
-- MCP servers needing a new sign-in: at the start and at the end of every turn of a task, the plugin
-  reads the target session's MCP server states (`session.info`, `mcp_servers`). A server whose
+- MCP servers needing a new sign-in: at the start and at the end of every turn of a task (past the
+  wait limit, when the approval watch ends), the plugin reads the target session's MCP server states
+  (`session.info`, `mcp_servers`). A server whose
   sign-in was rejected (`needs_auth`), or a remote (non-stdio) server that failed to connect, gets a
   notice in the manager conversation: task, profile, server, and the command that fixes it
   (`hermes -p <profile> mcp login <server>`). A target tool result carrying `needs_reauth: true`
@@ -65,7 +66,8 @@ profile served by the same Hermes gateway.
   (`_http_rejection`). On a failed `tool.complete` of an `mcp__<server>__*` tool, the plugin maps
   the tool to its server (Hermes' tool-to-server map, else the target profile's server names) and
   sends the notice when that connection's last HTTP error is a 401, or, for a remote server, when
-  the error text says 401 / unauthorized / invalid token. A stdio server's error text is not
+  the error text says 401 / unauthorized / invalid token (a failed result without an `error` key
+  is read as its whole JSON body). A stdio server's error text is not
   trusted: it may relay its own API's 401. The error-text fallback has a known false positive: a
   hosted (remote) MCP server that relays a third-party API's 401 in its error text gets a notice
   while its own connection is fine.

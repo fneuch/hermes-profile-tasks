@@ -339,7 +339,8 @@ def _mcp_tool_error_text(payload: dict) -> str:
         with contextlib.suppress(ValueError):
             result = json.loads(result)
     if isinstance(result, dict):
-        return str(result.get("error") or "")
+        # A failed result without an "error" key: its whole body is the error text.
+        return str(result.get("error") or (json.dumps(result) if payload.get("is_error") else ""))
     return str(result or "") if payload.get("is_error") else ""
 
 
@@ -609,6 +610,8 @@ class ProfileTasks:
                 # Keep relaying approvals until the turn ends; status reads the answer itself.
                 with contextlib.suppress(TimeoutError):
                     await conn.wait_terminal(session_id, admission_id, time.monotonic() + APPROVAL_WATCH_SECONDS)
+                # Servers that failed after the wait limit, before the watch ends.
+                await self._check_mcp_auth(conn, task_id)
                 return
         ok, body = _final_text(final)
         if ok:
