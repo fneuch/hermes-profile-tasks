@@ -57,6 +57,8 @@ _STATE_LOCK = threading.Lock()
 STOP_GRACE_SECONDS = 5.0
 WAITING = ("starting", "running")
 REFRESHABLE = ("starting", "running", "waiting_timeout", "wait_lost")
+# Notices kept on a keyed task (newest last); its follow-up clears them.
+KEYED_NOTICE_LIMIT = 20
 
 TARGET_GUIDANCE = (
     "Nobody watches this session live and nobody can answer a clarify question here. "
@@ -313,9 +315,24 @@ def _ended_by_stop(task: dict, last: dict) -> bool:
     return bool(cuts) and 0 <= max(cuts) - ended <= STOP_GRACE_SECONDS
 
 
+def _session_ref(profile: str | None, session_id: str | None) -> str:
+    """The desktop's session reference: a clickable chip that opens the session on its owning profile.
+
+    The desktop matches it up to the next whitespace, so it must stand alone between spaces or line ends.
+    """
+    return f"@session:{profile}/{session_id}"
+
+
 def _notice(message: str, kind: str) -> dict:
     """One outbox entry for the calling conversation."""
     return {"id": uuid.uuid4().hex[:8], "kind": kind, "text": message, "queued_at": time.time(), "attempts": []}
+
+
+def _keyed_notices(current: list, new: list, trigger: str) -> list:
+    """A keyed task's recorded notices plus *new*, capped; an answer's text is not kept (``last_answer`` has it)."""
+    added = [{k: v for k, v in e.items() if not (k == "text" and e["kind"] == "result")}
+             | {"delivered_at": None, "trigger": trigger} for e in new]
+    return (list(current) + added)[-KEYED_NOTICE_LIMIT:]
 
 
 def _reauth_server(payload: dict) -> str | None:
@@ -522,15 +539,25 @@ class ProfileTasks:
             raise ValueError("key is required")
         with self._key_lock:
             task = self.task_for_key(key)
+            starting = self._running_turn(task) if task is not None and not task.get("session_id") else None
             # A task that never got a session cannot take a follow-up: the key starts a new one.
-            if task is None or (not task.get("session_id") and not self._running_turn(task)):
+            if task is None or (not task.get("session_id") and not starting):
                 self._check_new(profile, text)
                 task_id, create = self._new_task(profile, title, None, key), True
             elif profile != task["profile"]:
                 raise ValueError(f"key {key} belongs to profile {task['profile']}, not {profile}")
+            elif starting:
+                raise ValueError(f"key {key} has a turn still running in {task['profile']} ({starting}); send "
+                                 f"again once result() returns its answer")
             else:
                 task_id, create = task["task_id"], False
+        sent_at = time.time()
         sent = self._send(task_id, text, create=True) if create else self.follow_up(task_id, text, keyed=True)
+        if not create and sent.get("accepted"):
+            # The notices of the earlier turns are not this turn's.
+            with self._outbox_lock:
+                self.store.modify(task_id, lambda current: {"notices": [
+                    e for e in current.get("notices") or [] if (e.get("queued_at") or 0) >= sent_at]})
         sent.pop("note", None)
         return {"key": key, **sent}
 
@@ -541,7 +568,16 @@ class ProfileTasks:
             raise ValueError(f"unknown key {key}")
         row = self.status(task["task_id"])["tasks"][0]
         keep = ("task_id", "profile", "status", "session_id", "link", "answer", "error", "pending_approval")
-        return {"key": task["key"], **{k: row[k] for k in keep if row.get(k) is not None}}
+        out = {"key": task["key"], **{k: row[k] for k in keep if row.get(k) is not None}}
+        current = self.store.get(task["task_id"]) or {}
+        # Wait limit, approvals, MCP sign-in and restart notices; the answer itself is in ``answer``.
+        notices = [{k: e.get(k) for k in ("kind", "text", "queued_at")} for e in current.get("notices") or []
+                   if e.get("text")]
+        if notices:
+            out["notices"] = notices
+        if "answer" in out and not current.get("delivered"):
+            self.store.update(task["task_id"], delivered=True, delivered_by="result")
+        return out
 
     def follow_up(self, task_id: str, text: str, *, keyed: bool = False) -> dict:
         task = self.store.get(task_id)
@@ -602,7 +638,7 @@ class ProfileTasks:
         task = self.store.get(task_id)
         return {
             "task_id": task_id, "accepted": True, "profile": task["profile"], "session_id": task["session_id"],
-            "session_title": task["title"], "link": f"hermes://open/{task['session_id']}",
+            "session_title": task["title"], "link": _session_ref(task["profile"], task["session_id"]),
             "note": (f"The {task['profile']} profile is working on it. Finish your turn now without waiting: "
                      "its final answer will arrive in this conversation as a new message."),
         }
@@ -704,12 +740,13 @@ class ProfileTasks:
         self.store.update(task_id, pending_approval=pending)
         expires = time.strftime("%H:%M:%S", time.localtime(pending["expires_at"]))
         self._notify(task_id, (
-            f"Task {task_id} ({profile}) is waiting for an approval in session {session_id} "
-            f"(hermes://open/{session_id}). It wants to run: {pending['command']} ({pending['description']}). "
+            f"Task {task_id} ({profile}) is waiting for an approval in session {session_id}. It wants to run: "
+            f"{pending['command']} ({pending['description']}). "
             f"The request expires in {round(timeout_s)} s, at {expires}; unanswered, the command does not run. "
             f"To answer it here, call profile_task action=approval task_id={task_id}: the approve/deny prompt "
             f"opens in this conversation and the answer goes to the {profile} session. It can also be answered "
-            f"in the {profile} session itself."), "approval")
+            f"in the {profile} session itself. To link that session in your reply, copy this reference verbatim, "
+            f"with a space or a line end on both sides:\n{_session_ref(profile, session_id)}\n"), "approval")
 
     def _approval_settled(self, task_id: str, payload: dict) -> None:
         task = self.store.get(task_id) or {}
@@ -755,7 +792,7 @@ class ProfileTasks:
             "interrupted": f"ended with the {profile} turn before the command reported back; it did not run",
         }.get(name, f"ended without running the command ({summary or name})")
         self._notify(task_id, (f"Task {task_id} ({profile}): the approval for `{approval.get('command')}` {what}. "
-                               f"Session {session_id} (hermes://open/{session_id})."), "approval_end")
+                               f"Session {session_id}: {_session_ref(profile, session_id)}"), "approval_end")
 
     # MCP servers of the target profile that need a new sign-in
     async def _check_mcp_auth(self, conn: _Connection, task_id: str) -> None:
@@ -935,9 +972,10 @@ class ProfileTasks:
         """Queue *message* for the task's calling conversation and try to hand over the queue in order."""
         if (self.store.get(task_id) or {}).get("key"):
             # A keyed task has no calling conversation: the notice is only recorded, never injected.
-            entry = _notice(message, kind) | {"delivered_at": None, "trigger": trigger}
+            entry = _notice(message, kind)
             with self._outbox_lock:
-                self.store.modify(task_id, lambda task: {"notices": list(task.get("notices") or []) + [entry]})
+                self.store.modify(task_id, lambda task: {
+                    "notices": _keyed_notices(task.get("notices") or [], [entry], trigger)})
             return True
         self._queue_only(task_id, message, kind)
         return self._flush_task(task_id, trigger)
@@ -954,36 +992,37 @@ class ProfileTasks:
             if task.get("key"):
                 # Queued by a restart: a keyed task's notices are recorded, never injected.
                 return not self.store.modify(task_id, lambda current: {
-                    "outbox": [], "notices": list(current.get("notices") or [])
-                    + [e | {"delivered_at": None, "trigger": trigger} for e in current.get("outbox") or []]})["outbox"]
-            outbox = list(task.get("outbox") or [])
+                    "outbox": [], "notices": _keyed_notices(current.get("notices") or [], current.get("outbox") or [],
+                                                            trigger)})["outbox"]
+            outbox = [dict(e) for e in task.get("outbox") or []]
+            if not outbox:
+                return True
+            # One injection for the whole queue: Hermes may queue separate injections made at once in any order.
+            try:
+                ok = bool(self.ctx.inject_message("\n\n".join(e["text"] for e in outbox),
+                                                  session_key=task.get("caller_session_key")))
+            except Exception:  # noqa: BLE001 - a raising injection counts as a refusal
+                logger.warning("profile-tasks: injection for task %s raised", task_id, exc_info=True)
+                ok = False
+            attempt = {"at": time.time(), "trigger": trigger, "ok": ok}
+            for entry in outbox:
+                entry["attempts"] = list(entry["attempts"]) + [attempt]
             sent: list[dict] = []
-            refused: dict | None = None
             fields: dict = {}
-            while outbox:
-                entry = dict(outbox[0])
-                try:
-                    ok = bool(self.ctx.inject_message(entry["text"], session_key=task.get("caller_session_key")))
-                except Exception:  # noqa: BLE001 - a raising injection counts as a refusal
-                    logger.warning("profile-tasks: injection for task %s raised", task_id, exc_info=True)
-                    ok = False
-                entry["attempts"] = list(entry["attempts"]) + [{"at": time.time(), "trigger": trigger, "ok": ok}]
-                if not ok:
-                    refused = entry
-                    logger.warning("profile-tasks: the calling conversation refused a %s notice of task %s; kept "
-                                   "for the next try", entry["kind"], task_id)
-                    break
-                outbox.pop(0)
-                sent.append({k: entry[k] for k in ("id", "kind", "queued_at", "attempts")}
-                            | {"delivered_at": time.time(), "trigger": trigger})
-                if entry["kind"] == "result":
+            if ok:
+                sent = [{k: e[k] for k in ("id", "kind", "queued_at", "attempts")}
+                        | {"delivered_at": attempt["at"], "trigger": trigger} for e in outbox]
+                if any(e["kind"] == "result" for e in outbox):
                     fields.update(delivered=True, delivered_by="injection")
+            else:
+                logger.warning("profile-tasks: the calling conversation refused %d notice(s) of task %s (%s); kept "
+                               "for the next try", len(outbox), task_id, ", ".join(e["kind"] for e in outbox))
+            tried = {e["id"]: e for e in outbox}
             delivered = {e["id"] for e in sent}
 
-            # Merged into the stored outbox: another process may have queued a notice during the injections.
+            # Merged into the stored outbox: another process may have queued a notice during the injection.
             def merge(current: dict) -> dict:
-                left = [refused if refused and e["id"] == refused["id"] else e
-                        for e in current.get("outbox") or [] if e["id"] not in delivered]
+                left = [tried.get(e["id"], e) for e in current.get("outbox") or [] if e["id"] not in delivered]
                 return {"outbox": left, "notices": list(current.get("notices") or []) + sent, **fields}
 
             return not self.store.modify(task_id, merge)["outbox"]
@@ -1034,16 +1073,21 @@ class ProfileTasks:
         if not waiting and not approval:
             return None
         profile, session_id = task.get("profile"), task.get("session_id")
-        parts = [f"Task {task_id} ({profile}): the gateway restarted"]
+        keyed = bool(task.get("key"))
+        parts = [f"Task {task_id} ({profile}): the gateway restarted" if not keyed else "The gateway restarted"]
         fields: dict = {"waiter": None, "pending_approval": None, "settling_approval": None}
         if waiting and not (session_id and task.get("admission_id")):
             fields.update(status="failed", error="the gateway restarted before the target accepted the task")
             parts.append(" before the target accepted it. Start it again.")
+        elif waiting and keyed:
+            fields.update(status="wait_lost", error="the gateway restarted while the task was waiting")
+            parts.append(f" while the {profile} turn was running; result() reads that turn's answer from the "
+                         f"{profile} session {session_id}.")
         elif waiting:
             fields.update(status="wait_lost", error="the gateway restarted while the task was waiting")
             parts.append(f" while this task was waiting, so its answer will not be injected here. Check it "
                          f"with profile_task action=status task_id={task_id}; the {profile} session "
-                         f"{session_id} still exists (hermes://open/{session_id}).")
+                         f"{session_id} still exists: {_session_ref(profile, session_id)}")
         else:
             parts.append(f" after the wait limit, while the {profile} session had an approval open.")
         if approval:
@@ -1127,7 +1171,7 @@ class ProfileTasks:
         rows = []
         for tid, t in tasks.items():
             row = {k: t.get(k) for k in keep}
-            row["link"] = f"hermes://open/{t['session_id']}" if t.get("session_id") else None
+            row["link"] = _session_ref(t["profile"], t["session_id"]) if t.get("session_id") else None
             if t.get("pending_approval"):
                 row["pending_approval"] = {k: t["pending_approval"].get(k) for k in
                                            ("command", "description", "expires_at")}
@@ -1261,11 +1305,16 @@ def send(key: str, profile: str, text: str, title: str | None = None) -> dict:
 def result(key: str, wait: float = 0.0) -> dict:
     """The state of *key*'s task: ``status`` (``starting``/``running`` while its turn runs, then ``answered``,
     ``failed``, ``waiting_timeout`` or ``wait_lost``), ``answer`` (the last turn's final text, once answered),
-    ``error``, ``pending_approval``, ``task_id``, ``session_id``, ``link``. With *wait*, blocks up to that many
-    seconds while the turn runs. Raises ValueError for an unknown key.
+    ``error``, ``pending_approval``, ``task_id``, ``session_id``, ``link``, and ``notices`` (wait limit,
+    approvals, MCP sign-in, restart: ``kind``, ``text``, ``queued_at``) when there are any. With *wait*, blocks up
+    to that many seconds while the turn runs. Raises ValueError for an unknown key or a non-numeric *wait*.
     """
     plugin = _loaded()
-    deadline = time.monotonic() + max(0.0, float(wait))
+    try:
+        seconds = float(wait)
+    except (TypeError, ValueError):
+        raise ValueError(f"wait must be a number of seconds, not {wait!r}") from None
+    deadline = time.monotonic() + max(0.0, seconds)
     while True:
         row = plugin.keyed_result(key)
         remaining = deadline - time.monotonic()
@@ -1280,7 +1329,16 @@ def register(ctx: Any) -> None:
     if missing:
         logger.error("profile-tasks: Hermes internals missing after an update; the %s tool will refuse every "
                      "call until the plugin is fixed: %s", TOOL_NAME, "; ".join(missing))
+    if _PLUGIN is not None:
+        logger.warning("profile-tasks: registered again in this process; send() and result() now use the new load")
     plugin = _PLUGIN = ProfileTasks(ctx, missing)
+
+    def _forget() -> None:
+        global _PLUGIN
+        if _PLUGIN is plugin:
+            _PLUGIN = None
+
+    ctx.on_unload(_forget)
     if not missing:
         recovered = plugin.recover_after_restart()
         if recovered:

@@ -39,6 +39,9 @@ class FakeCtx:
     def register_hook(self, name, callback):
         self.hooks.append(name)
 
+    def on_unload(self, callback):
+        pass
+
     def get_config(self, key, default=None):
         return default
 

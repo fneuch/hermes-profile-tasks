@@ -13,6 +13,7 @@ import contextlib
 import json
 import os
 import pwd
+import re
 import signal
 import sqlite3
 import subprocess
@@ -556,7 +557,9 @@ async def trial_approval(ctx) -> None:
                                 APPROVAL_TIMEOUT + 60, "approval ending notice")
             ended_at = time.time()
             stored = await until(lambda: plugin_task(task_id).get("last_approval"), 30, "stored approval outcome")
-            check("approval", f"hermes://open/{asid}" in notice and probe.name in notice
+            # The desktop's session chip: whitespace or a line end on both sides, copied verbatim.
+            ref = re.search(rf"(?:^|\s)@session:analyst/{re.escape(asid)}(?:\s|$)", notice)
+            check("approval", ref is not None and "verbatim" in notice and probe.name in notice
                   and "action=approval" in notice and (how != "expire" or ended_at - notice_at > APPROVAL_TIMEOUT - 3),
                   f"approval then {how}: the manager got the command, task, session and link while it was answerable",
                   notice=notice, seconds_notice_before_ending=round(ended_at - notice_at, 1))

@@ -77,7 +77,7 @@ def main() -> int:
         plugin.store.update(task_id, session_id=session_id, status="running", admission_id=f"a{len(sent)}",
                             turns=list(task.get("turns") or []) + [f"a{len(sent)}"], waiter=me)
         return {"task_id": task_id, "accepted": True, "profile": task["profile"], "session_id": session_id,
-                "session_title": task["title"], "link": f"hermes://open/{session_id}", "note": "finish your turn"}
+                "session_title": task["title"], "link": mod._session_ref(task["profile"], session_id), "note": "finish your turn"}
 
     plugin._send = fake_send
     plugin._running_turn = lambda task: None
@@ -99,15 +99,37 @@ def main() -> int:
           "the final answer is returned by result and injected nowhere", result=got, injected=ctx.injected)
     notices = plugin.store.get(first["task_id"]).get("notices") or []
     check(len(notices) == 1 and notices[0]["delivered_at"] is None and not plugin.store.get(first["task_id"]).get(
-          "outbox"), "the answer notice is recorded on the task, never queued for injection", notices=notices)
+          "outbox") and "text" not in notices[0] and "notices" not in got
+          and plugin.store.get(first["task_id"]).get("delivered") is True,
+          "the answer notice is recorded on the task without its text, never queued for injection; result marks "
+          "the answer delivered", notices=notices, result=got)
+
+    # The wait limit and an MCP sign-in problem reach the keyed caller through result.
+    plugin._deliver(first["task_id"], "no answer within 30 minutes", status="waiting_timeout", kind="wait_limit")
+    plugin._mcp_auth_notice(first["task_id"], "jira", "sign-in rejected")
+    # Past the wait limit status reads the target turn; there is no target here.
+    plugin._refresh = lambda task: {}
+    got = mod.result("pr-1")
+    del plugin._refresh
+    kinds = [n["kind"] for n in got.get("notices") or []]
+    check(kinds == ["wait_limit", "mcp_auth"] and "mcp login jira" in got["notices"][1]["text"]
+          and all(set(n) == {"kind", "text", "queued_at"} for n in got["notices"]) and not ctx.injected,
+          "result lists the wait limit and MCP re-authentication notices of a keyed task", result=got)
+
+    for i in range(mod.KEYED_NOTICE_LIMIT + 5):
+        plugin._notify(first["task_id"], f"notice {i}", "approval")
+    kept = plugin.store.get(first["task_id"])["notices"]
+    check(len(kept) == mod.KEYED_NOTICE_LIMIT and kept[-1]["text"] == f"notice {mod.KEYED_NOTICE_LIMIT + 4}",
+          "a keyed task keeps only its latest notices", kept=len(kept), last=kept[-1].get("text"))
+    plugin.store.update(first["task_id"], status="answered", last_answer="A1")
 
     again = mod.send("pr-1", "reviewer", "Q1 follow-up")
     t1 = plugin.store.get(first["task_id"])
     check(again["task_id"] == first["task_id"] and again["session_id"] == first["session_id"]
           and sent[-1] == (first["task_id"], "Q1 follow-up", False) and len(t1["turns"]) == 2
-          and t1.get("last_answer") is None and t1["caller_session_key"] is None,
-          "a later send on the same key is a follow-up in the same session; the previous answer is cleared",
-          again=again, turns=t1["turns"])
+          and t1.get("last_answer") is None and t1["caller_session_key"] is None and not t1.get("notices"),
+          "a later send on the same key is a follow-up in the same session; the previous answer and notices are "
+          "cleared", again=again, turns=t1["turns"], notices=t1.get("notices"))
 
     started = time.monotonic()
     waited = mod.result("pr-1", wait=1.5)
@@ -122,11 +144,20 @@ def main() -> int:
         "unknown profile": raises(ValueError, mod.send, "pr-3", "nope", "x"),
         "empty text": raises(ValueError, mod.send, "pr-4", "reviewer", "  "),
         "unknown key": raises(ValueError, mod.result, "pr-404"),
+        "non-numeric wait": raises(ValueError, mod.result, "pr-1", wait="soon"),
     }
     plugin._running_turn = lambda task: "turn started"
     errors["turn running"] = raises(ValueError, mod.send, "pr-2", "reviewer", "x")
     plugin._running_turn = lambda task: None
+    # A second send on a key whose first send is still being submitted (no session yet).
+    plugin.store.update("t-start", task_id="t-start", profile="reviewer", key="pr-6", caller_session_key=None,
+                        title="Task t-start", created_at=time.time(), status="starting", session_id=None, turns=[],
+                        waiter=me)
+    plugin._running_turn = mod.ProfileTasks._running_turn.__get__(plugin)
+    errors["still starting"] = raises(ValueError, mod.send, "pr-6", "reviewer", "x")
+    plugin._running_turn = lambda task: None
     check(all(errors.values()) and "belongs to profile reviewer" in errors["other profile"]
+          and "turn still running" in errors["still starting"] and "no session" not in errors["still starting"]
           and not plugin.task_for_key("pr-3") and not plugin.task_for_key("pr-4"),
           "refused calls raise ValueError and create no task", errors=errors)
 
@@ -153,10 +184,36 @@ def main() -> int:
     time.sleep(0.2)
     plugin._flush_task(second["task_id"], "load")
     t2 = plugin.store.get(second["task_id"])
-    check(second["task_id"] in found and not t2.get("outbox") and not ctx.injected
-          and any(n["kind"] == "restart" for n in t2.get("notices") or []) and t2["status"] == "wait_lost",
-          "a keyed task cut off by a restart gets its notice recorded, never injected", found=found,
+    restart = [n for n in t2.get("notices") or [] if n["kind"] == "restart"]
+    text = restart[0]["text"] if restart else ""
+    check(second["task_id"] in found and not t2.get("outbox") and not ctx.injected and restart
+          and t2["status"] == "wait_lost" and f"Task {second['task_id']}" not in text and "profile_task" not in text
+          and "injected" not in text and "result()" in text,
+          "a keyed task cut off by a restart gets a neutral notice recorded, never injected", found=found,
           notices=t2.get("notices"), status=t2["status"])
+
+    class UnloadCtx(FakeCtx):
+        def __init__(self):
+            super().__init__()
+            self.unload = []
+
+        def register_tool(self, **kw):
+            pass
+
+        def register_hook(self, name, callback):
+            pass
+
+        def on_unload(self, callback):
+            self.unload.append(callback)
+
+    mod._PLUGIN = None
+    unload_ctx = UnloadCtx()
+    mod.register(unload_ctx)
+    loaded = mod._PLUGIN is not None
+    for callback in unload_ctx.unload:
+        callback()
+    check(loaded and mod._PLUGIN is None, "unloading the plugin clears the plugin send() and result() use",
+          callbacks=len(unload_ctx.unload))
 
     print("FAILURES", failures, flush=True)
     return 1 if failures else 0

@@ -6,7 +6,10 @@ profile served by the same Hermes gateway.
 - `start`: creates one session under the target profile, the way the desktop does
   (`session.create` with `source="gui"`, titled `Task <id>: <title>`), then submits the text
   (`prompt.submit`). Returns at once: task id, target profile, session id, title and a
-  `hermes://open/<session id>` link.
+  `link`, the desktop's session reference `@session:<profile>/<session id>`. The desktop renders it
+  as a clickable chip (in a user message) or link (in a model reply) that opens the session on its
+  profile, only when it stands alone: whitespace or a line end on both sides, no punctuation or
+  parenthesis glued to it.
 - When the target's turn ends, its final text is injected once into the calling manager
   conversation (`ctx.inject_message`), which starts a manager turn.
 - `follow_up`: sends a new text to the same session (same context). Refused while the task's turn
@@ -22,7 +25,9 @@ profile served by the same Hermes gateway.
   resends or discards the turn in the desktop). Status also lists, per task, the last approval's
   outcome and any notice the manager conversation has not taken yet.
 - Notices to the manager conversation (answers, wait limit, approvals, restarts) are kept in the
-  plugin state until that conversation takes them. A refused one is retried, in order, at the start
+  plugin state until that conversation takes them. All the notices a task has queued go in one
+  injection, in order: Hermes may queue separate injections made at once in any order. Notices of
+  different tasks are still separate injections. A refused one is retried, in order, at the start
   of the next `profile_task` call or at the next event of its task; the gateway refuses a
   conversation that no client has open.
 - Gateway restart: when the plugin loads, it finds the tasks whose waiting process is gone, marks
@@ -36,8 +41,9 @@ profile served by the same Hermes gateway.
   is not cancelled, check back with `status`.
 - Approvals in a task session: the plugin's connection to the target session sees its
   `approval.request` at once and injects a notice into the manager conversation (command, task,
-  session, `hermes://open/<session>` link, expiry time from the target profile's
-  `approvals.timeout`). When the request ends, a second notice gives the real outcome, read from the
+  session, its `@session:<profile>/<session>` reference on a line of its own with the instruction to
+  copy it verbatim, expiry time from the target profile's `approvals.timeout`). The approval ending
+  and restart notices end with the same reference. When the request ends, a second notice gives the real outcome, read from the
   gated tool's result (its approval summary): approved and run, denied, expired, withdrawn, or
   ended with the turn. `approval` (action) shows the approve/deny prompt in the manager
   conversation itself; the choice made there (`once`, `session`, `always`, `deny`) is sent to the
@@ -106,11 +112,17 @@ gateway loaded, `sys.modules["hermes_plugins.profile_tasks"]`:
   of the key still running. A key whose task never got a session starts a new task.
 - `result(key, wait=0)`: `status` (`starting`/`running`, then `answered`, `failed`,
   `waiting_timeout` or `wait_lost`), `answer` (the last turn's final text, once answered), `error`,
-  `pending_approval`, `task_id`, `session_id`, `link`. `wait` blocks up to that many seconds while
-  the turn runs. Past the wait limit or after a restart it reads the target turn, like `status`.
+  `pending_approval`, `task_id`, `session_id`, `link`, and `notices` when there are any: the
+  wait limit, approval, MCP sign-in and restart notices (`kind`, `text`, `queued_at`). `wait` blocks
+  up to that many seconds while the turn runs; a non-numeric `wait` raises `ValueError`. Past the
+  wait limit or after a restart it reads the target turn, like `status`. A second `send` on a key
+  whose first one is still being submitted raises `ValueError` (turn still running).
 
 Nothing is injected into any conversation for a keyed task: its notices (answer, approval, wait
-limit, restart) are only recorded on the task. Keyed tasks are left out of the tool's
+limit, MCP sign-in, restart) are only recorded on the task, the latest 20, the answer's without its
+text (it is the `answer`); an accepted follow-up clears those of the earlier turns. A keyed task's
+restart notice names no task id and points to `result()`. Unloading the plugin clears what
+`send`/`result` use; they then raise until it is loaded again. Keyed tasks are left out of the tool's
 `action=status` list. Keys and tasks are kept in the plugin state like the tool's.
 
 ## Enable (not done by this repo)
@@ -150,7 +162,9 @@ only read (code and interpreter).
   set-aside reading (breaker open or parked after a 401; not after a 500 or past the cooldown).
 - `PT_SCRIPT=tests/test_keyed.py e2e/run.sh`: `send`/`result` by key with a fake target: one task and
   session per key, follow-up in the same session, answer returned and injected nowhere, refused
-  calls, keyed tasks out of the tool's status list, a restart notice recorded only.
+  calls (including a non-numeric `wait` and a send while the key's first send is being submitted),
+  wait-limit and MCP sign-in notices in `result`, notices capped and cleared by a follow-up, keyed
+  tasks out of the tool's status list, a neutral restart notice recorded only, unload.
 - `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets restart followup
   retry mcp_auth keyed approval`; `keyed` calls `send`/`result` from a gateway thread of the
   `e2e/probe-plugin` plugin, with no conversation; `approval` runs last because its relayed `always` permanently allows recursive
@@ -171,6 +185,10 @@ Trial 9 (clicking the link in the desktop) is not covered: the isolated run has 
 
 ## Known issues
 
-- Flaky e2e trial `retry` (pre-existing, not fixed here): its closing check
-  `manager_saw('is waiting for an approval')` races the manager's model requests. It failed 5 runs
-  out of 5 standalone on 379e94b.
+- `inject_message` returns True once the message is scheduled, before it is queued for the session;
+  separate injections made at once can reach the session queue in any order. This made the e2e
+  trial `retry` flaky: its three kept notices, handed over in three injections, could queue the
+  approval notice last, still unread when the run stopped the gateway. Fixed by injecting a task's
+  queued notices together (10 standalone runs of `retry` in a row passed). Notices of different
+  tasks, or of events far enough apart, are still separate injections, and an injection refused
+  after scheduling is not seen by the plugin.
