@@ -69,11 +69,14 @@ TARGET_GUIDANCE = (
 def check_internals(ctx: Any = None) -> list[str]:
     """Names of the Hermes internals this plugin uses that the running Hermes no longer has.
 
-    With *ctx*, also checks that the plugin context still exposes its plugin manager as ``_manager``.
+    With *ctx*, also checks that the plugin context still exposes its plugin manager as ``_manager``
+    and its ``on_unload`` registration.
     """
     missing: list[str] = []
     if ctx is not None and not hasattr(ctx, "_manager"):
         missing.append("hermes_cli.plugins_context.PluginContext._manager")
+    if ctx is not None and not hasattr(ctx, "on_unload"):
+        missing.append("hermes_cli.plugins_context.PluginContext.on_unload")
 
     def need(module: str, names: tuple[str, ...]) -> Any:
         try:
@@ -1362,7 +1365,8 @@ def register(ctx: Any) -> None:
         if _PLUGIN is plugin:
             _PLUGIN = None
 
-    ctx.on_unload(_forget)
+    if hasattr(ctx, "on_unload"):
+        ctx.on_unload(_forget)
     if not missing:
         recovered = plugin.recover_after_restart()
         if recovered:

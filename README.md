@@ -43,22 +43,23 @@ profile served by the same Hermes gateway.
   `approval.request` at once and injects a notice into the manager conversation (command, task,
   session, its `@session:<profile>/<session>` reference on a line of its own with the instruction to
   copy it verbatim, expiry time from the target profile's `approvals.timeout`). The approval ending
-  and restart notices end with the same reference. When the request ends, a second notice gives the real outcome, read from the
-  gated tool's result (its approval summary): approved and run, denied, expired, withdrawn, or
-  ended with the turn. `approval` (action) shows the approve/deny prompt in the manager
-  conversation itself; the choice made there (`once`, `session`, `always`, `deny`) is sent to the
-  target session with `approval.respond`, so the command runs there. `always` permanently allows
-  that kind of command in the target profile (its `command_allowlist`) and leaves one inert rule in
-  the manager profile's config (`plugin_rule:profile_task_relay:<prompt id>`, one per relayed
-  prompt, never matched again); the prompt's own text says so. Limits: the prompt opens only
-  when the manager turn calls `approval` (a plugin cannot open an approval prompt in a conversation
-  with no running turn); its card title is the generic plugin rule, the target command is in its
-  description; it uses the manager profile's approval timeout, and if the manager's approvals are
-  bypassed (yolo or mode off) nothing is passed on and the target request stays pending. If the
-  target request ends (expired, answered in the target session, turn interrupted) while the card is
-  open, the card is withdrawn and the manager is told the real ending; an answer that reaches the
-  plugin after that ending is not recorded as pending nor sent to the target session.
-  After the wait limit the plugin keeps watching the target turn (up to 24 h) only to relay approvals.
+  and restart notices end with the same reference. When the request ends, a second notice gives the
+  real outcome, read from the gated tool's result (its approval summary): approved and run, denied,
+  expired, withdrawn, or ended with the turn. `approval` (action) shows the approve/deny prompt in
+  the manager conversation itself; the choice made there (`once`, `session`, `always`, `deny`) is
+  sent to the target session with `approval.respond`, so the command runs there. `always`
+  permanently allows that kind of command in the target profile (its `command_allowlist`) and leaves
+  one inert rule in the manager profile's config (`plugin_rule:profile_task_relay:<prompt id>`, one
+  per relayed prompt, never matched again); the prompt's own text says so. Limits: the prompt opens
+  only when the manager turn calls `approval` (a plugin cannot open an approval prompt in a
+  conversation with no running turn); its card title is the generic plugin rule, the target command
+  is in its description; it uses the manager profile's approval timeout, and if the manager's
+  approvals are bypassed (yolo or mode off) nothing is passed on and the target request stays
+  pending. If the target request ends (expired, answered in the target session, turn interrupted)
+  while the card is open, the card is withdrawn and the manager is told the real ending; an answer
+  that reaches the plugin after that ending is not recorded as pending nor sent to the target
+  session. After the wait limit the plugin keeps watching the target turn (up to 24 h) only to relay
+  approvals.
 - MCP servers needing a new sign-in: at the start and at the end of every turn of a task (past the
   wait limit, when the approval watch ends), the plugin reads the target session's MCP server states
   (`session.info`, `mcp_servers`). A server whose

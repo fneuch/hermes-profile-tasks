@@ -1,6 +1,6 @@
 """Load-time check of the profile-tasks plugin: present internals pass, a removed one blocks the tool.
 
-Also: a plugin context without ``_manager`` blocks the tool.
+Also: a plugin context without ``_manager`` or ``on_unload`` blocks the tool.
 
 Run: ``PT_SCRIPT=tests/test_load_check.py e2e/run.sh`` (isolated HOME/HERMES_HOME, the installed Hermes
 interpreter).
@@ -77,6 +77,30 @@ def main() -> int:
     print("context without _manager -> tool reply:", reply)
     name = "hermes_cli.plugins_context.PluginContext._manager"
     failures += not (any(name in m for m in logged) and name in json.dumps(reply) and "error" in reply)
+
+    class NoUnloadCtx(FakeCtx):
+        def __getattribute__(self, name):
+            if name == "on_unload":
+                raise AttributeError(name)
+            return super().__getattribute__(name)
+
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger().addHandler(handler)
+    ctx = NoUnloadCtx()
+    try:
+        mod.register(ctx)
+    except Exception as exc:  # noqa: BLE001 - a raise here is the half-load this case guards against
+        print("context without on_unload -> register raised:", repr(exc))
+    logging.getLogger().removeHandler(handler)
+    logged = [r.getMessage() for r in records if r.levelno >= logging.ERROR]
+    reply = json.loads(ctx.tools[0]["handler"]({"action": "status"})) if ctx.tools else None
+    print("context without on_unload -> logged:", logged)
+    print("context without on_unload -> tool reply:", reply)
+    name = "hermes_cli.plugins_context.PluginContext.on_unload"
+    failures += not (reply is not None and any(name in m for m in logged) and name in json.dumps(reply)
+                     and "error" in reply and ctx.hooks)
 
     import hermes_cli.gateway_client as gc
     saved = gc._session_ticket
