@@ -192,6 +192,44 @@ def main() -> int:
           "a keyed task cut off by a restart gets a neutral notice recorded, never injected", found=found,
           notices=t2.get("notices"), status=t2["status"])
 
+    # Every notice a keyed task can get, from the plugin's own code paths.
+    k7 = mod.send("pr-7", "reviewer", "Q7")["task_id"]
+    plugin._approval_raised(k7, {"prompt_id": "p7", "command": "rm -rf x", "description": "recursive delete",
+                                 "timeout_s": 10})
+    plugin._approval_ended(k7, ("timeout", ""))
+    plugin._mcp_auth_notice(k7, "jira7", "sign-in rejected")
+    plugin._deliver(k7, mod._wait_limit_text(k7, plugin.store.get(k7), 30.0), status="waiting_timeout",
+                    kind="wait_limit")
+    plugin._approval_raised(k7, {"prompt_id": "p8", "command": "rm -rf y", "description": "recursive delete",
+                                 "timeout_s": 10})
+
+    async def cut_off(task_id, text, create, accepted, ready):
+        ready.set()
+        raise ConnectionError("connection reset")
+
+    plugin._send_and_wait = cut_off
+    plugin._run_send(k7, "x", False, {}, __import__("threading").Event())
+    del plugin._send_and_wait
+    plugin.store.update(k7, waiter="999999999:0", status="running",
+                        pending_approval={"prompt_id": "p9", "command": "rm -rf z", "timeout_s": 10,
+                                          "raised_at": time.time()})
+    plugin.recover_after_restart()
+    plugin._flush_task(k7, "load")
+    task_ids = set(plugin.store.all())
+    texts = []
+    for t in plugin.store.all().values():
+        if t.get("key"):
+            for n in t.get("notices") or []:
+                if n.get("text"):
+                    texts.append((n["kind"], n["text"].replace(t.get("session_id") or "\0", "<session>")))
+    leaks = [(kind, text) for kind, text in texts
+             if "profile_task" in text or any(tid in text for tid in task_ids)]
+    kinds7 = [n["kind"] for n in plugin.store.get(k7).get("notices") or []]
+    check(not leaks and set(kinds7) >= {"approval", "approval_end", "mcp_auth", "wait_limit", "wait_lost", "restart"}
+          and not ctx.injected,
+          "no keyed notice text names profile_task or a task id (approval, its ending, MCP sign-in, wait limit, "
+          "cut-off wait, restart)", leaks=leaks, kinds=kinds7, checked=len(texts))
+
     class UnloadCtx(FakeCtx):
         def __init__(self):
             super().__init__()

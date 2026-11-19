@@ -121,7 +121,9 @@ gateway loaded, `sys.modules["hermes_plugins.profile_tasks"]`:
 Nothing is injected into any conversation for a keyed task: its notices (answer, approval, wait
 limit, MCP sign-in, restart) are only recorded on the task, the latest 20, the answer's without its
 text (it is the `answer`); an accepted follow-up clears those of the earlier turns. A keyed task's
-restart notice names no task id and points to `result()`. Unloading the plugin clears what
+notices name it by key, never by task id, never tell it to call `profile_task`, and point to
+`result()` (wait limit, cut-off wait, restart); an approval in its session can only be answered in
+that session, whose `@session:` reference the notice gives. Unloading the plugin clears what
 `send`/`result` use; they then raise until it is loaded again. Keyed tasks are left out of the tool's
 `action=status` list. Keys and tasks are kept in the plugin state like the tool's.
 
@@ -164,7 +166,8 @@ only read (code and interpreter).
   session per key, follow-up in the same session, answer returned and injected nowhere, refused
   calls (including a non-numeric `wait` and a send while the key's first send is being submitted),
   wait-limit and MCP sign-in notices in `result`, notices capped and cleared by a follow-up, keyed
-  tasks out of the tool's status list, a neutral restart notice recorded only, unload.
+  tasks out of the tool's status list, a neutral restart notice recorded only, no keyed notice
+  text naming `profile_task` or a task id, unload.
 - `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets restart followup
   retry mcp_auth keyed approval`; `keyed` calls `send`/`result` from a gateway thread of the
   `e2e/probe-plugin` plugin, with no conversation; `approval` runs last because its relayed `always` permanently allows recursive

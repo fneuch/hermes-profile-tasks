@@ -323,6 +323,19 @@ def _session_ref(profile: str | None, session_id: str | None) -> str:
     return f"@session:{profile}/{session_id}"
 
 
+def _wait_limit_text(task_id: str, task: dict, minutes: float) -> str:
+    check = ("result() reads the answer once the turn ends" if task.get("key")
+             else f"Check back later with profile_task action=status task_id={task_id}")
+    return f"{_label(task_id, task)}: no answer within {minutes} minutes. The work is not cancelled. {check}."
+
+
+def _label(task_id: str, task: dict) -> str:
+    """How a notice names its task: by key for a keyed caller, which never sees task ids."""
+    if task.get("key"):
+        return f"Key {task['key']} ({task.get('profile')})"
+    return f"Task {task_id} ({task.get('profile')})"
+
+
 def _notice(message: str, kind: str) -> dict:
     """One outbox entry for the calling conversation."""
     return {"id": uuid.uuid4().hex[:8], "kind": kind, "text": message, "queued_at": time.time(), "attempts": []}
@@ -654,9 +667,13 @@ class ProfileTasks:
             else:
                 error = f"{exc.__class__.__name__}: {exc}"
                 lost = self._drop_dead_approval(task_id, "the plugin lost its connection to the target session")
-                self._deliver(task_id, f"Task {task_id}: the wait for the answer was cut off ({error}). The work in "
-                                       f"the target session may still finish. Check with profile_task action=status "
-                                       f"task_id={task_id}.{lost}", status="wait_lost", error=error, kind="wait_lost")
+                task = self.store.get(task_id) or {}
+                check = ("result() reads it" if task.get("key")
+                         else f"Check with profile_task action=status task_id={task_id}")
+                head = _label(task_id, task) if task.get("key") else f"Task {task_id}"
+                self._deliver(task_id, f"{head}: the wait for the answer was cut off ({error}). The work in "
+                                       f"the target session may still finish. {check}.{lost}", status="wait_lost",
+                              error=error, kind="wait_lost")
 
     async def _send_and_wait(self, task_id: str, text: str, create: bool, accepted: dict,
                              ready: threading.Event) -> None:
@@ -688,10 +705,8 @@ class ProfileTasks:
                 await self._check_mcp_auth(conn, task_id)
             except TimeoutError:
                 minutes = round(self._wait_seconds() / 60, 1)
-                self._deliver(task_id, (
-                    f"Task {task_id} ({task['profile']}): no answer within {minutes} minutes. The work is not "
-                    f"cancelled. Check back later with profile_task action=status task_id={task_id}."),
-                    status="waiting_timeout", kind="wait_limit")
+                self._deliver(task_id, _wait_limit_text(task_id, task, minutes), status="waiting_timeout",
+                              kind="wait_limit")
                 # Keep relaying approvals until the turn ends; status reads the answer itself.
                 with contextlib.suppress(TimeoutError):
                     await conn.wait_terminal(session_id, admission_id, time.monotonic() + APPROVAL_WATCH_SECONDS)
@@ -739,6 +754,14 @@ class ProfileTasks:
                    "raised_at": raised, "expires_at": raised + timeout_s}
         self.store.update(task_id, pending_approval=pending)
         expires = time.strftime("%H:%M:%S", time.localtime(pending["expires_at"]))
+        if task.get("key"):
+            # A keyed caller has no conversation to relay the approval into.
+            self._notify(task_id, (
+                f"{_label(task_id, task)} is waiting for an approval in session {session_id}. It wants to run: "
+                f"{pending['command']} ({pending['description']}). The request expires in {round(timeout_s)} s, "
+                f"at {expires}; unanswered, the command does not run. It can be answered in the {profile} "
+                f"session: {_session_ref(profile, session_id)}"), "approval")
+            return
         self._notify(task_id, (
             f"Task {task_id} ({profile}) is waiting for an approval in session {session_id}. It wants to run: "
             f"{pending['command']} ({pending['description']}). "
@@ -791,7 +814,7 @@ class ProfileTasks:
                          "command did not run",
             "interrupted": f"ended with the {profile} turn before the command reported back; it did not run",
         }.get(name, f"ended without running the command ({summary or name})")
-        self._notify(task_id, (f"Task {task_id} ({profile}): the approval for `{approval.get('command')}` {what}. "
+        self._notify(task_id, (f"{_label(task_id, task)}: the approval for `{approval.get('command')}` {what}. "
                                f"Session {session_id}: {_session_ref(profile, session_id)}"), "approval_end")
 
     # MCP servers of the target profile that need a new sign-in
@@ -862,9 +885,10 @@ class ProfileTasks:
             first = self.store.modify(task_id, mark) is not None
         if not first:
             return
-        profile = (self.store.get(task_id) or {}).get("profile")
+        task = self.store.get(task_id) or {}
+        profile = task.get("profile")
         self._notify(task_id, (
-            f"Task {task_id} ({profile}): the MCP server '{server}' of the {profile} profile needs "
+            f"{_label(task_id, task)}: the MCP server '{server}' of the {profile} profile needs "
             f"re-authentication: {why}. Its tools may be unavailable to this task. To fix it, run: "
             f"hermes -p {profile} mcp login {server}"), "mcp_auth")
 
@@ -1074,11 +1098,11 @@ class ProfileTasks:
             return None
         profile, session_id = task.get("profile"), task.get("session_id")
         keyed = bool(task.get("key"))
-        parts = [f"Task {task_id} ({profile}): the gateway restarted" if not keyed else "The gateway restarted"]
+        parts = [f"{_label(task_id, task)}: the gateway restarted"]
         fields: dict = {"waiter": None, "pending_approval": None, "settling_approval": None}
         if waiting and not (session_id and task.get("admission_id")):
             fields.update(status="failed", error="the gateway restarted before the target accepted the task")
-            parts.append(" before the target accepted it. Start it again.")
+            parts.append(" before the target accepted it. " + ("Send it again." if keyed else "Start it again."))
         elif waiting and keyed:
             fields.update(status="wait_lost", error="the gateway restarted while the task was waiting")
             parts.append(f" while the {profile} turn was running; result() reads that turn's answer from the "
