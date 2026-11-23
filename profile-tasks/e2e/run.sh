@@ -9,7 +9,9 @@ AGENT="${HERMES_AGENT_DIR:-$HOME/.hermes/hermes-agent}"
 # The interpreter of the installed Hermes environment (read only); the checkout's venv/ may be an older Python.
 PY="${HERMES_PYTHON:-$(python3 -c 'import json,glob,sys; f=sorted(glob.glob(sys.argv[1]+"/installs/*/facts.json"))[0]; print(json.load(open(f))["packages"]["venv"]["environment"]+"/bin/python")' "$HOME/.hermes")}"
 ROOT="${PT_E2E_BASE:-$HOME/.cache/profile-tasks-e2e}"
-BASE="$ROOT/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$ROOT"
+# Its own directory per invocation, even for two started in the same second.
+BASE="$(mktemp -d "$ROOT/$(date +%Y%m%d-%H%M%S)-XXXXXX")"
 mkdir -p "$BASE/home" "$BASE/run"
 chmod 700 "$BASE/run"
 

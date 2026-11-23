@@ -14,7 +14,7 @@ import logging
 import sys
 from pathlib import Path
 
-PLUGIN = Path(__file__).resolve().parents[1] / "profile-tasks" / "__init__.py"
+PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
 
 
 def load():

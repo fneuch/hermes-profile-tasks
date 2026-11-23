@@ -32,7 +32,7 @@ profile served by the same Hermes gateway.
   conversation that no client has open.
 - Gateway restart: when the plugin loads, it finds the tasks whose waiting process is gone, marks
   them (`wait_lost`, or `failed` if the target never accepted the task), closes any approval that
-  was open (the command did not run), and queues one notice per task to its manager conversation.
+  was open (whether the command ran is unknown), and queues one notice per task to its manager conversation.
   It sends them once the gateway accepts plugin messages, then as above. When several processes load
   the plugin at once (a gateway launcher that then attaches to the running gateway, and that gateway),
   each task is closed and noticed by one of them only: the plugin state is read and written under a
@@ -44,10 +44,19 @@ profile served by the same Hermes gateway.
   session, its `@session:<profile>/<session>` reference on a line of its own with the instruction to
   copy it verbatim, expiry time from the target profile's `approvals.timeout`). The approval ending
   and restart notices end with the same reference. When the request ends, a second notice gives the
-  real outcome, read from the gated tool's result (its approval summary): approved and run, denied,
-  expired, withdrawn, or ended with the turn. `approval` (action) shows the approve/deny prompt in
-  the manager conversation itself; the choice made there (`once`, `session`, `always`, `deny`) is
-  sent to the target session with `approval.respond`, so the command runs there. `always`
+  real outcome, read from the gated tool's result (its approval summary, or the `BLOCKED:` refusal of
+  a file-write gate such as a protected `SOUL.md`): approved and run, denied,
+  expired, withdrawn, or ended with the turn. The approval names no tool call, so the gated call is
+  taken among the target's calls running when it was raised: a result blocked by the approval ends
+  it at once; a call that ran ends it once no other call of that set is still running. A call
+  started after the approval does not end it, and a call that is the only one an open approval
+  lists is not counted for a later approval. When two approvals open over the same running calls,
+  a result listed by both cannot be told apart: the notice says whether it ran is unknown and to
+  check the target session, instead of naming an outcome. Each of those approvals keeps that
+  unknown outcome for the results that follow. `approval` (action) shows the
+  approve/deny prompt in the manager conversation itself; the choice made there (`once`,
+  `session`, `always`, `deny`) is sent to the target session with `approval.respond`, so the
+  command runs there. `always`
   permanently allows that kind of command in the target profile (its `command_allowlist`) and leaves
   one inert rule in the manager profile's config (`plugin_rule:profile_task_relay:<prompt id>`, one
   per relayed prompt, never matched again); the prompt's own text says so. Limits: the prompt opens
@@ -113,7 +122,8 @@ gateway loaded, `sys.modules["hermes_plugins.profile_tasks"]`:
   of the key still running. A key whose task never got a session starts a new task.
 - `result(key, wait=0)`: `status` (`starting`/`running`, then `answered`, `failed`,
   `waiting_timeout` or `wait_lost`), `answer` (the last turn's final text, once answered), `error`,
-  `pending_approval`, `task_id`, `session_id`, `link`, and `notices` when there are any: the
+  `pending_approval` (the oldest one still waiting when the target session has several), `task_id`,
+  `session_id`, `link`, and `notices` when there are any: the
   wait limit, approval, MCP sign-in and restart notices (`kind`, `text`, `queued_at`). `wait` blocks
   up to that many seconds while the turn runs; a non-numeric `wait` raises `ValueError`. Past the
   wait limit or after a restart it reads the target turn, like `status`. A second `send` on a key
@@ -128,16 +138,28 @@ that session, whose `@session:` reference the notice gives. Unloading the plugin
 `send`/`result` use; they then raise until it is loaded again. Keyed tasks are left out of the tool's
 `action=status` list. Keys and tasks are kept in the plugin state like the tool's.
 
-## Enable (not done by this repo)
+## Enable
 
-1. Link or copy `profile-tasks/` into the default profile's plugin folder:
-   `ln -s ~/git/perso/hermes-profile-tasks/profile-tasks ~/.hermes/plugins/profile-tasks`
+Tested against Hermes Agent v0.23.3 (commit `caafe5389ae5`) and v0.23.2 (commit `ae2a81ccc00e`).
+Supported on Linux and macOS: the waiting-process check reads `/proc` on Linux and uses `psutil` (a
+Hermes dependency) on macOS. The tests run on Linux; they cover the macOS path by hiding `/proc`.
+Linux only in the e2e harness: the remote MCP fixture also dies with the harness process
+(`PR_SET_PDEATHSIG`); elsewhere the harness stops it on exit only.
+
+1. Clone this repo (private: `gh` signed in as an account with access), then link (or copy) this
+   folder into the default profile's plugin folder and enable it:
+
+   ```bash
+   gh repo clone fneuch/hermes-profile-tasks
+   mkdir -p ~/.hermes/plugins
+   ln -s "$PWD/hermes-profile-tasks/profile-tasks" ~/.hermes/plugins/profile-tasks
+   hermes plugins enable profile-tasks
+   ```
+
 2. In `~/.hermes/config.yaml`:
 
    ```yaml
    plugins:
-     enabled:
-       - profile-tasks          # add to the existing list
      entries:
        profile-tasks:
          allow_gateway_injection: true   # lets the plugin inject the answer into the manager session
@@ -169,8 +191,22 @@ only read (code and interpreter).
   wait-limit and MCP sign-in notices in `result`, notices capped and cleared by a follow-up, keyed
   tasks out of the tool's status list, a neutral restart notice recorded only, no keyed notice
   text naming `profile_task` or a task id, unload.
+- `PT_SCRIPT=tests/test_turn_races.py e2e/run.sh`: turn and approval races with a fake target: two
+  follow-ups racing start one turn, a follow-up clears the previous answer and error, an earlier
+  turn ending late leaves the newer turn's state, an interrupted approval reports an unknown
+  outcome, an approval answer counts as forwarded only once the target took it, a call running
+  beside the gated one does not end its approval, a status read of an earlier turn leaves a newer
+  turn's state, frames queued before the terminal receipt still reach the plugin, an approval the
+  target had already ended is not reported as forwarded, two approvals open in one session each
+  end on their own call, a failure after the 120 s acknowledgement wait is recorded, a new turn
+  drops the earlier turn's open calls, a finished task is not reported cut off at the next load.
+- `PT_SCRIPT=tests/test_liveness.py e2e/run.sh`: the waiting-process check with `/proc` (Linux) and
+  with `/proc` hidden (the macOS path): a live waiter, a reused pid, a gone pid, a zombie.
+- `PT_SCRIPT=tests/test_e2e_harness.py e2e/run.sh`: the probe plugin's response is never read half
+  written; `e2e/stop_gateway.py` reads a gateway that exits while it is read as stopped.
 - `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets restart followup
-  retry mcp_auth keyed approval`; `keyed` calls `send`/`result` from a gateway thread of the
+  retry mcp_auth keyed approval`; with no argument all but `9`, which needs the desktop app and runs
+  only when named; `keyed` calls `send`/`result` from a gateway thread of the
   `e2e/probe-plugin` plugin, with no conversation; `approval` runs last because its relayed `always` permanently allows recursive
   delete in the isolated analyst profile). Evidence is written to `e2e/evidence/run-<timestamp>.json`. The analyst profile gets
   a fixture MCP server named `atlassian` (from the Hermes test fixtures) whose answer carries a

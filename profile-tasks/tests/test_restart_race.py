@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 # The loading processes read the plugin path from PT_PLUGIN, set from the third argument.
-PLUGIN = Path(os.environ.get("PT_PLUGIN") or Path(__file__).resolve().parents[1] / "profile-tasks" / "__init__.py")
+PLUGIN = Path(os.environ.get("PT_PLUGIN") or Path(__file__).resolve().parents[1] / "__init__.py")
 
 
 def load():
@@ -98,8 +98,8 @@ def verify(tasks: dict) -> list[str]:
         text = "".join(e["text"] for e in tasks[task_id].get("outbox") or [] if e["kind"] == "restart")
         if last.get("outcome") != "interrupted":
             errors.append(f"{task_id}: approval outcome {last.get('outcome')}")
-        if "did not run" not in text:
-            errors.append(f"{task_id}: restart notice does not say the command did not run")
+        if "whether the command ran is unknown" not in text:
+            errors.append(f"{task_id}: restart notice does not say the command outcome is unknown")
     if [e["id"] for e in tasks["t-watchlost"]["outbox"] if e["kind"] == "wait_lost"] != ["w1"]:
         errors.append("t-watchlost: the earlier wait_lost notice was lost")
     if (tasks["t-steered"].get("last_approval") or {}).get("outcome") != "cancelled":
@@ -131,9 +131,10 @@ def main(argv: list[str]) -> int:
         seed(ctx, dead)
         start_at = time.time() + 1.5
         children = [subprocess.Popen([sys.executable, __file__, "--child", str(start_at)]) for _ in range(procs)]
-        for proc in children:
-            proc.wait(60)
+        codes = [proc.wait(60) for proc in children]
         errors = verify(ctx.state.get("tasks"))
+        # One surviving load can recover every task: a crashed one must still fail the round.
+        errors += [f"a loading process exited {code}" for code in codes if code != 0]
         failed += bool(errors)
         print(f"round {n + 1}: {'FAIL ' + json.dumps(errors) if errors else 'ok'}", flush=True)
     print(f"{rounds - failed}/{rounds} rounds passed with {procs} concurrent loads")

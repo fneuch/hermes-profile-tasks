@@ -40,7 +40,7 @@ RELAY_RULE = "profile_task_relay"
 LOAD_FLUSH_WAIT_SECONDS = 300
 APPROVAL_OUTCOMES = ("denied", "timeout", "cancelled", "notify_failed", "blocked")
 # Target frames the waiter hands to the plugin: approvals, the tool result that shows how one ended, turn ends.
-WATCHED_FRAMES = ("approval.request", "approval.settled", "tool.complete", "message.complete")
+WATCHED_FRAMES = ("approval.request", "approval.settled", "tool.start", "tool.complete", "message.complete")
 RPC_METHODS = ("session.create", "session.resume", "prompt.submit", "prompt.receipt", "session.steer",
                "approval.respond", "session.info")
 _REQUIRED_FIELDS = {
@@ -140,11 +140,33 @@ def _approval_outcome(payload: dict) -> tuple[str, str]:
         try:
             result = json.loads(result)
         except ValueError:
-            result = {}
-    if not isinstance(result, dict) or result.get("status") != "blocked":
-        return "ran", ""
-    summary = str(result.get("user_summary") or "")
-    return _summary_outcome(summary), summary
+            pass
+    if isinstance(result, dict) and result.get("status") == "blocked":
+        summary = str(result.get("user_summary") or "")
+        return _summary_outcome(summary), summary
+    refusal = _write_gate_refusal(result)
+    if refusal is not None:
+        return refusal
+    return "ran", ""
+
+
+# Phrases of the file-write approval gates (tools/file_tools_write_guards.py, English only) -> outcome key.
+_WRITE_GATE_OUTCOMES = (("timed out", "timeout"), ("withdrawn", "cancelled"), ("denied", "denied"),
+                        ("could not be delivered", "notify_failed"), ("Failed to send", "notify_failed"))
+
+
+def _write_gate_refusal(result: Any) -> tuple[str, str] | None:
+    """(outcome, refusal text) when a file-write gate refused the call, else None.
+
+    Those gates return a plain ``{"error": "BLOCKED: write to ..."}``, without the ``status`` of a command gate.
+    """
+    text = result.get("error") if isinstance(result, dict) else result
+    if not isinstance(text, str) or not text.startswith("BLOCKED:"):
+        return None
+    for phrase, outcome in _WRITE_GATE_OUTCOMES:
+        if phrase in text:
+            return outcome, text
+    return "not_run", text
 
 
 def _summary_outcome(summary: str) -> str:
@@ -253,6 +275,7 @@ class _Connection:
             receipt = await self.rpc("prompt.receipt", session_id=session_id, admission_id=admission_id,
                                      include_result=True)
             if receipt["status"] in ("terminal", "unknown"):
+                self._drain()
                 return receipt
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -263,28 +286,64 @@ class _Connection:
             except TimeoutError:
                 backoff = min(backoff * 2, 5.0)
 
+    def _drain(self) -> None:
+        """Hand over the frames already queued: the gateway sent them before the terminal receipt."""
+        while True:
+            try:
+                event = self.client.events.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if isinstance(event, Exception):
+                # The connection ended after the receipt was read; nothing more can be queued.
+                return
+            self._dispatch(event)
+
+    def _dispatch(self, event: dict) -> dict:
+        frame = event.get("params") or {}
+        if self.on_frame is not None and frame.get("type") in WATCHED_FRAMES:
+            try:
+                self.on_frame(frame)
+            except Exception:  # noqa: BLE001 - a relay failure must not end the wait
+                logger.warning("profile-tasks: target frame handling failed", exc_info=True)
+        return frame
+
     async def _completion(self, admission_id: str) -> None:
         while True:
             event = await self.client.events.get()
             if isinstance(event, Exception):
                 raise event
-            frame = event.get("params") or {}
-            if self.on_frame is not None and frame.get("type") in WATCHED_FRAMES:
-                try:
-                    self.on_frame(frame)
-                except Exception:  # noqa: BLE001 - a relay failure must not end the wait
-                    logger.warning("profile-tasks: target frame handling failed", exc_info=True)
+            frame = self._dispatch(event)
             if frame.get("type") == "message.complete" and (frame.get("payload") or {}).get("admission_id") == admission_id:
                 return
 
 
-def _process_token(pid: int) -> str:
-    """pid plus its start time (Linux /proc), so a reused pid does not pass for the waiting process."""
+# Process states of a process that no longer runs: Linux /proc letters, then psutil names (macOS).
+_ENDED_STATES = ("Z", "X", "zombie", "dead")
+
+
+def _process_state(pid: int) -> tuple[str, str] | None:
+    """(start time, state) of *pid*, or None when no such process can be read.
+
+    Read from /proc where there is one (Linux), else with psutil, a Hermes dependency (macOS).
+    """
+    if Path("/proc/self/stat").exists():
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            return fields[19], fields[0]
+        except (OSError, IndexError):
+            return None
+    import psutil
     try:
-        start = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-    except (OSError, IndexError):
-        start = ""
-    return f"{pid}:{start}"
+        proc = psutil.Process(pid)
+        return f"{proc.create_time():.6f}", proc.status()
+    except psutil.Error:
+        return None
+
+
+def _process_token(pid: int) -> str:
+    """pid plus its start time, so a reused pid does not pass for the waiting process."""
+    state = _process_state(pid)
+    return f"{pid}:{state[0] if state else ''}"
 
 
 def _waiter_alive(token: str | None) -> bool:
@@ -298,13 +357,11 @@ def _waiter_alive(token: str | None) -> bool:
         return False
     except PermissionError:
         pass
-    try:
-        # A killed waiter stays a zombie until its parent reaps it; it no longer waits.
-        if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] in ("Z", "X"):
-            return False
-    except (OSError, IndexError):
+    state = _process_state(pid)
+    # A killed waiter stays a zombie until its parent reaps it; it no longer waits.
+    if state is None or state[1] in _ENDED_STATES:
         return False
-    return _process_token(pid) == token
+    return f"{pid}:{state[0]}" == token
 
 
 def _ended_by_stop(task: dict, last: dict) -> bool:
@@ -316,6 +373,29 @@ def _ended_by_stop(task: dict, last: dict) -> bool:
     cuts = [e["queued_at"] for e in list(task.get("outbox") or []) + list(task.get("notices") or [])
             if e.get("kind") == "wait_lost"]
     return bool(cuts) and 0 <= max(cuts) - ended <= STOP_GRACE_SECONDS
+
+
+def _approvals(task: dict) -> dict[str, dict]:
+    """The task's open approvals by prompt_id, oldest first; ``stage`` is ``pending`` or ``settling``.
+
+    A task stored by an earlier version has only the single ``pending_approval``/``settling_approval`` fields.
+    """
+    found: dict[str, dict] = {}
+    if "approvals" in task:
+        found = {p: dict(a) for p, a in (task.get("approvals") or {}).items()}
+    else:
+        for field, stage in (("settling_approval", "settling"), ("pending_approval", "pending")):
+            legacy = task.get(field)
+            if legacy and legacy.get("prompt_id"):
+                found[legacy["prompt_id"]] = {**legacy, "stage": stage}
+    return dict(sorted(found.items(), key=lambda item: item[1].get("raised_at") or 0))
+
+
+def _approval_fields(approvals: dict[str, dict]) -> dict:
+    """Store fields for *approvals*; ``pending_approval``/``settling_approval`` show the oldest of each stage."""
+    def oldest(stage: str) -> dict | None:
+        return next((a for a in approvals.values() if a.get("stage") == stage), None)
+    return {"approvals": approvals, "pending_approval": oldest("pending"), "settling_approval": oldest("settling")}
 
 
 def _session_ref(profile: str | None, session_id: str | None) -> str:
@@ -457,6 +537,11 @@ class ProfileTasks:
         self._outbox_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._key_lock = threading.Lock()
+        # Held while a target frame is handled and while a follow_up reserves the next turn: an earlier turn's
+        # frame is handled whole before the turn changes, or seen as stale after.
+        self._turn_lock = threading.RLock()
+        # task_id -> tool call ids of the target turn that started and have not completed yet.
+        self._open_calls: dict[str, set[str]] = {}
 
     def _gateway_host(self) -> bool:
         """True once this process runs a gateway that accepts plugin messages."""
@@ -539,7 +624,8 @@ class ProfileTasks:
         label = f"Task {task_id}" + (f": {title.strip()[:80]}" if title and title.strip() else "")
         self.store.update(task_id, task_id=task_id, profile=profile, caller_session_key=caller_key,
                           title=label, created_at=time.time(), status="starting", session_id=None, turns=[],
-                          waiter=_process_token(os.getpid()), **({"key": key} if key else {}))
+                          waiter=_process_token(os.getpid()), turn_token=uuid.uuid4().hex,
+                          **({"key": key} if key else {}))
         return task_id
 
     # programmatic surface: a keyed task has no calling conversation; its caller reads it with result()
@@ -553,9 +639,12 @@ class ProfileTasks:
         key = (key or "").strip()
         if not key:
             raise ValueError("key is required")
+        # Read before the lock: the receipt is a network call of up to ACK_TIMEOUT_SECONDS.
+        earlier = self.task_for_key(key)
+        read = self._read_turn(earlier) if earlier is not None and not earlier.get("session_id") else None
         with self._key_lock:
             task = self.task_for_key(key)
-            starting = self._running_turn(task) if task is not None and not task.get("session_id") else None
+            starting = self._running_turn(task, read) if task is not None and not task.get("session_id") else None
             # A task that never got a session cannot take a follow-up: the key starts a new one.
             if task is None or (not task.get("session_id") and not starting):
                 self._check_new(profile, text)
@@ -604,30 +693,45 @@ class ProfileTasks:
         if not text.strip():
             raise ValueError("text is required")
         from gateway.session_context import bound_session_key
+        # Read before the lock: the receipt is a network call of up to ACK_TIMEOUT_SECONDS.
+        read = self._read_turn(task)
         with self._send_lock:
-            running = self._running_turn(task)
+            # Re-read under the lock: a concurrent follow_up may have reserved the next turn since the read above.
+            task = self.store.get(task_id) or task
+            running = self._running_turn(task, read)
             if running:
                 raise ValueError(
                     f"task {task_id} has a turn running in {task['profile']} ({running}). A follow_up now would "
                     f"start a second turn on the same task. Use action=correct to change the running turn, or "
                     f"send the follow_up after its answer arrives.")
-            if keyed:
-                # The previous turn's answer must not pass for this turn's in result().
-                self.store.update(task_id, status="starting", last_answer=None, error=None,
-                                  waiter=_process_token(os.getpid()))
-            else:
-                caller_key = bound_session_key() or task["caller_session_key"]
-                self.store.update(task_id, caller_session_key=caller_key, status="starting",
-                                  waiter=_process_token(os.getpid()))
+            # The previous turn's answer, error and admission must not pass for this turn's in status or result().
+            fields = {"status": "starting", "last_answer": None, "error": None, "admission_id": None,
+                      "waiter": _process_token(os.getpid()), "turn_token": uuid.uuid4().hex}
+            if not keyed:
+                fields["caller_session_key"] = bound_session_key() or task["caller_session_key"]
+            with self._turn_lock:
+                self.store.update(task_id, **fields)
         return self._send(task_id, text, create=False)
 
-    def _running_turn(self, task: dict) -> str | None:
-        """Why the task's turn counts as running (a short reason), or None when a follow_up may start."""
+    def _read_turn(self, task: dict) -> dict | None:
+        """The receipt of the task's latest turn, tagged with its admission id; None when it has none."""
+        if not task.get("admission_id"):
+            return None
+        return {**self._run_async(self._read_receipt_ok(task)), "admission_id": task["admission_id"]}
+
+    @staticmethod
+    def _running_turn(task: dict, read: dict | None) -> str | None:
+        """Why the task's turn counts as running (a short reason), or None when a follow_up may start.
+
+        *read* is ``_read_turn`` of an earlier snapshot, taken before the caller's lock: no network call is made here.
+        """
         if task.get("status") == "starting" and _waiter_alive(task.get("waiter")):
             return "being submitted"
         if not task.get("admission_id"):
             return None
-        answer = self._run_async(self._read_receipt_ok(task))
+        if read is None or read.get("admission_id") != task["admission_id"]:
+            return "a newer turn started while its state was read"
+        answer = read
         if not answer.get("ok"):
             return f"its state could not be read: {answer.get('error')}"
         state = answer["receipt"].get("status")
@@ -649,7 +753,6 @@ class ProfileTasks:
                     "error": f"the target gateway did not accept the task within {ACK_TIMEOUT_SECONDS}s; "
                              "check later with action=status"}
         if "error" in accepted:
-            self.store.update(task_id, status="failed", error=accepted["error"])
             return {"task_id": task_id, "accepted": False, "error": accepted["error"]}
         task = self.store.get(task_id)
         return {
@@ -660,29 +763,38 @@ class ProfileTasks:
         }
 
     def _run_send(self, task_id: str, text: str, create: bool, accepted: dict, ready: threading.Event) -> None:
+        # The turn this worker owns; a later follow_up replaces the token and the task state with it.
+        turn = (self.store.get(task_id) or {}).get("turn_token")
         try:
             asyncio.run(self._send_and_wait(task_id, text, create, accepted, ready))
         except Exception as exc:  # noqa: BLE001 - every failure is reported to the manager
             logger.warning("profile-tasks: task %s failed", task_id, exc_info=True)
+            error = f"{exc.__class__.__name__}: {exc}"
+            self._end_calls(task_id, turn)
             if not ready.is_set():
-                accepted["error"] = f"{exc.__class__.__name__}: {exc}"
+                accepted["error"] = error
+                # Stored here, not by _send: after the ack timeout nobody else records the failure.
+                self._record(task_id, turn, status="failed", error=error, waiter=None)
                 ready.set()
             else:
-                error = f"{exc.__class__.__name__}: {exc}"
-                lost = self._drop_dead_approval(task_id, "the plugin lost its connection to the target session")
                 task = self.store.get(task_id) or {}
+                # A newer turn's approval is not this worker's to drop.
+                lost = (self._drop_dead_approval(task_id, "the plugin lost its connection to the target session")
+                        if turn is None or task.get("turn_token") == turn else "")
                 check = ("result() reads it" if task.get("key")
                          else f"Check with profile_task action=status task_id={task_id}")
                 head = _label(task_id, task) if task.get("key") else f"Task {task_id}"
                 self._deliver(task_id, f"{head}: the wait for the answer was cut off ({error}). The work in "
                                        f"the target session may still finish. {check}.{lost}", status="wait_lost",
-                              error=error, kind="wait_lost")
+                              error=error, kind="wait_lost", turn=turn)
 
     async def _send_and_wait(self, task_id: str, text: str, create: bool, accepted: dict,
                              ready: threading.Event) -> None:
         task = self.store.get(task_id)
+        # Read before the target accepts the text: no follow_up can replace it until then.
+        turn = task.get("turn_token")
         async with _Connection(self._home(task["profile"]),
-                               on_frame=lambda frame: self._on_target_frame(task_id, frame)) as conn:
+                               on_frame=lambda frame: self._on_target_frame(task_id, frame, turn)) as conn:
             if create:
                 snapshot = await conn.rpc("session.create", source="gui", request_id=task_id, title=task["title"])
                 session_id = snapshot["session_id"]
@@ -693,6 +805,9 @@ class ProfileTasks:
                 await conn.rpc("session.resume", session_id=session_id, omit_messages=True)
                 payload = text
             submission_id = uuid.uuid4().hex
+            with self._turn_lock:
+                # Tool calls of an earlier turn that never reported back cannot gate this turn's approvals.
+                self._open_calls.pop(task_id, None)
             receipt = await conn.rpc("prompt.submit", session_id=session_id, text=payload,
                                      submission_id=submission_id)
             admission_id = receipt["admission_id"]
@@ -709,25 +824,41 @@ class ProfileTasks:
             except TimeoutError:
                 minutes = round(self._wait_seconds() / 60, 1)
                 self._deliver(task_id, _wait_limit_text(task_id, task, minutes), status="waiting_timeout",
-                              kind="wait_limit")
+                              kind="wait_limit", turn=turn)
                 # Keep relaying approvals until the turn ends; status reads the answer itself.
                 with contextlib.suppress(TimeoutError):
                     await conn.wait_terminal(session_id, admission_id, time.monotonic() + APPROVAL_WATCH_SECONDS)
                 # Servers that failed after the wait limit, before the watch ends.
                 await self._check_mcp_auth(conn, task_id)
+                self._end_calls(task_id, turn)
                 return
+        self._end_calls(task_id, turn)
         ok, body = _final_text(final)
         if ok:
             message = f"Answer from {task['profile']} for task {task_id} (session {session_id}):\n\n{body}"
-            self._deliver(task_id, message, status="answered", last_answer=body)
+            self._deliver(task_id, message, status="answered", last_answer=body, turn=turn)
         else:
             message = (f"Task {task_id} ({task['profile']}) did not complete: {body}\n"
                        f"The {task['profile']} session {session_id} still exists.")
-            self._deliver(task_id, message, status="failed", error=body)
+            self._deliver(task_id, message, status="failed", error=body, turn=turn)
+
+    def _end_calls(self, task_id: str, turn: str | None) -> None:
+        """Forget the task's open tool calls once *turn* stopped watching, unless a newer turn owns the task."""
+        with self._turn_lock:
+            if turn is None or (self.store.get(task_id) or {}).get("turn_token") == turn:
+                self._open_calls.pop(task_id, None)
 
     # approvals raised in a target session
-    def _on_target_frame(self, task_id: str, frame: dict) -> None:
-        task = self.store.get(task_id) or {}
+    def _on_target_frame(self, task_id: str, frame: dict, turn: str | None = None) -> None:
+        """Handle one frame of the target session; with *turn*, only while that turn still owns the task."""
+        with self._turn_lock:
+            task = self.store.get(task_id) or {}
+            if turn is not None and task.get("turn_token") not in (None, turn):
+                # A follow_up started a newer turn: this connection's late frames are the earlier turn's.
+                return
+            self._handle_frame(task_id, task, frame)
+
+    def _handle_frame(self, task_id: str, task: dict, frame: dict) -> None:
         if frame.get("session_id") not in (None, task.get("session_id")):
             return
         payload = frame.get("payload") or {}
@@ -741,10 +872,57 @@ class ProfileTasks:
         elif kind == "approval.settled" and payload.get("prompt_id"):
             self._approval_settled(task_id, payload)
         # On expiry the gated tool's result can arrive before approval.settled.
-        elif kind == "tool.complete" and (task.get("settling_approval") or task.get("pending_approval")):
-            self._approval_ended(task_id, _approval_outcome(payload))
-        elif kind == "message.complete" and (task.get("settling_approval") or task.get("pending_approval")):
-            self._approval_ended(task_id, ("interrupted", ""))
+        elif kind == "tool.complete" and _approvals(task):
+            self._call_completed(task_id, payload)
+        elif kind == "message.complete":
+            for prompt_id in _approvals(task):
+                self._approval_ended(task_id, prompt_id, ("interrupted", ""))
+        if kind == "tool.start" and payload.get("tool_id"):
+            self._open_calls.setdefault(task_id, set()).add(str(payload["tool_id"]))
+        elif kind == "tool.complete":
+            self._open_calls.get(task_id, set()).discard(str(payload.get("tool_id") or ""))
+        elif kind == "message.complete":
+            self._open_calls.pop(task_id, None)
+
+    def _call_completed(self, task_id: str, payload: dict) -> None:
+        """End an open approval on its gated call's result only, not on a call running beside it.
+
+        An approval names no tool call, so its gated one is among the calls running when it was raised
+        (``calls``). A result blocked by an approval ends one approval that lists the call, a settled one first;
+        a call that ran ends each approval listing it once no other call of its set is still running. An approval
+        raised with no call running (no tool.start seen) ends on any result no listing approval claims. A result
+        listed by more than one open approval cannot be told apart, so it ends them as ``unattributed``; each
+        approval that listed it stays ``unattributed`` for the results that follow.
+        """
+        outcome = _approval_outcome(payload)
+        tool_id = str(payload.get("tool_id") or "")
+        ended: list[str] = []
+        unattributed: set[str] = set()
+
+        def take(task: dict) -> dict | None:
+            approvals = _approvals(task)
+            # A settled approval first: its gated call's result follows approval.settled.
+            order = sorted(approvals, key=lambda p: approvals[p].get("stage") != "settling")
+            named = [p for p in order if tool_id in (approvals[p].get("calls") or [])]
+            shared = len(named) > 1
+            # raised_calls keeps the set seen at raise time: a set drained by other results is not "no calls".
+            unnamed = [p for p in order if not approvals[p].get("raised_calls", approvals[p].get("calls"))]
+            for prompt_id in named:
+                approvals[prompt_id] = {**approvals[prompt_id],
+                                        "calls": [c for c in approvals[prompt_id]["calls"] if c != tool_id],
+                                        "unattributed": shared or bool(approvals[prompt_id].get("unattributed"))}
+            unattributed.clear()
+            unattributed.update(p for p in approvals if approvals[p].get("unattributed"))
+            if outcome[0] != "ran":
+                ended[:] = (named or unnamed)[:1]
+            else:
+                ended[:] = [p for p in named if not approvals[p]["calls"]] if named else unnamed[:1]
+            return _approval_fields(approvals) if named else None
+
+        self.store.modify(task_id, take)
+        for prompt_id in ended:
+            ending = ("unattributed", outcome[1]) if prompt_id in unattributed else outcome
+            self._approval_ended(task_id, prompt_id, ending)
 
     def _approval_raised(self, task_id: str, payload: dict) -> None:
         task = self.store.get(task_id) or {}
@@ -754,8 +932,19 @@ class ProfileTasks:
         pending = {"prompt_id": payload["prompt_id"], "execution_generation": payload.get("execution_generation"),
                    "command": payload.get("command") or "", "description": payload.get("description") or "",
                    "choices": list(payload.get("choices") or ["once", "deny"]), "timeout_s": timeout_s,
-                   "raised_at": raised, "expires_at": raised + timeout_s}
-        self.store.update(task_id, pending_approval=pending)
+                   "raised_at": raised, "expires_at": raised + timeout_s, "stage": "pending"}
+        running = set(self._open_calls.get(task_id, ()))
+
+        def add(t: dict) -> dict:
+            approvals = _approvals(t)
+            # A call is gated by one approval at most: the only call of an open approval is not this one's.
+            taken = {a["calls"][0] for a in approvals.values() if len(a.get("calls") or []) == 1}
+            calls = sorted(running - taken)
+            # Hermes keeps one prompt per request: a second approval in the session sits beside the first.
+            return _approval_fields({**approvals, pending["prompt_id"]: {**pending, "calls": calls,
+                                                                         "raised_calls": calls}})
+
+        self.store.modify(task_id, add)
         expires = time.strftime("%H:%M:%S", time.localtime(pending["expires_at"]))
         if task.get("key"):
             # A keyed caller has no conversation to relay the approval into.
@@ -775,38 +964,55 @@ class ProfileTasks:
             f"with a space or a line end on both sides:\n{_session_ref(profile, session_id)}\n"), "approval")
 
     def _approval_settled(self, task_id: str, payload: dict) -> None:
-        task = self.store.get(task_id) or {}
-        pending = task.get("pending_approval") or {}
         prompt_id = payload["prompt_id"]
-        if pending.get("prompt_id") != prompt_id:
-            return
+        # Read under the relay lock: approval() marks the same approval relayed under it.
         with self._relay_lock:
+            pending = _approvals(self.store.get(task_id) or {}).get(prompt_id)
+            if not pending or pending.get("stage") != "pending":
+                return
             relay = self._relays.get(prompt_id)
-        forwarded = bool(relay and relay.get("forwarded")) or bool(pending.get("relayed"))
-        # The settled frame names no outcome; the gated tool's result that follows it does.
-        self.store.update(task_id, pending_approval=None,
-                          settling_approval={**pending, "settled_at": time.time(), "relayed": forwarded})
-        if relay is not None and not forwarded:
+            # The manager's answer is in flight: approval() marks it relayed once the target confirms.
+            forwarding = bool(relay and relay.get("forwarding"))
+            forwarded = bool(relay and relay.get("forwarded")) or bool(pending.get("relayed"))
+            # The settled frame names no outcome; the gated tool's result that follows it does.
+            settling = {**pending, "stage": "settling", "settled_at": time.time(), "relayed": forwarded}
+            self.store.modify(task_id, lambda t: _approval_fields({**_approvals(t), prompt_id: settling})
+                              if prompt_id in _approvals(t) else None)
+        if relay is not None and not forwarded and not forwarding:
             self._withdraw_manager_card(relay, "the request in the target session ended")
 
-    def _approval_ended(self, task_id: str, outcome: tuple[str, str]) -> None:
-        """Record how an approval really ended and tell the calling conversation, unless it answered it itself."""
-        task = self.store.get(task_id) or {}
-        approval = task.get("settling_approval") or task.get("pending_approval")
-        if not approval:
+    def _approval_ended(self, task_id: str, prompt_id: str, outcome: tuple[str, str]) -> None:
+        """Record how approval *prompt_id* really ended and tell the calling conversation, unless it answered it."""
+        # Under the relay lock so a card answered now either forwards first or sees the approval gone.
+        with self._relay_lock:
+            task = self.store.get(task_id) or {}
+            approval = _approvals(task).get(prompt_id)
+            if not approval:
+                return
+            message, record = self._ended_text(task_id, task, approval, outcome)
+            if self.store.modify(task_id, lambda t: {**_approval_fields(
+                    {p: a for p, a in _approvals(t).items() if p != prompt_id}), "last_approval": record}
+                    if prompt_id in _approvals(t) else None) is None:
+                # A restart or a lost watch closed it since the read above; that path told the caller.
+                return
+            relay = self._relays.get(prompt_id)
+            # Its answer is being forwarded: approval() sends this notice only if that forward fails.
+            deferred = relay is not None and bool(relay.get("forwarding"))
+            if deferred:
+                relay["ended_notice"] = message
+        if relay is not None and not relay.get("forwarded") and not deferred:
+            self._withdraw_manager_card(relay, "the request in the target session ended")
+        if approval.get("relayed") or deferred:
             return
+        self._notify(task_id, message, "approval_end")
+
+    @staticmethod
+    def _ended_text(task_id: str, task: dict, approval: dict, outcome: tuple[str, str]) -> tuple[str, dict]:
+        """The notice and the ``last_approval`` record of an approval that ended with *outcome*."""
         name, summary = outcome
         settled = approval.get("settled_at") or time.time()
         record = {**approval, "outcome": name, "user_summary": summary,
                   "settled_after_s": round(settled - approval["raised_at"], 1)}
-        # Under the relay lock so a card answered now either forwards first or sees the approval gone.
-        with self._relay_lock:
-            self.store.update(task_id, pending_approval=None, settling_approval=None, last_approval=record)
-            relay = self._relays.get(approval["prompt_id"])
-        if relay is not None and not relay.get("forwarded"):
-            self._withdraw_manager_card(relay, "the request in the target session ended")
-        if approval.get("relayed"):
-            return
         profile, session_id = task.get("profile"), task.get("session_id")
         what = {
             "ran": f"was approved in the {profile} session; the command ran",
@@ -815,10 +1021,15 @@ class ProfileTasks:
                         f"approvals.timeout is {round(approval['timeout_s'])} s); the command did not run"),
             "cancelled": "was withdrawn before anyone answered (the turn was interrupted or corrected); the "
                          "command did not run",
-            "interrupted": f"ended with the {profile} turn before the command reported back; it did not run",
+            "interrupted": (f"ended with the {profile} turn before the command reported back; whether it ran is "
+                            f"unknown: check the {profile} session before running it again"),
+            "unattributed": (f"ended, but its result cannot be told apart from another approval open at the same "
+                             f"time; whether it ran is unknown: check the {profile} session before running it "
+                             f"again"),
         }.get(name, f"ended without running the command ({summary or name})")
-        self._notify(task_id, (f"{_label(task_id, task)}: the approval for `{approval.get('command')}` {what}. "
-                               f"Session {session_id}: {_session_ref(profile, session_id)}"), "approval_end")
+        message = (f"{_label(task_id, task)}: the approval for `{approval.get('command')}` {what}. "
+                   f"Session {session_id}: {_session_ref(profile, session_id)}")
+        return message, record
 
     # MCP servers of the target profile that need a new sign-in
     async def _check_mcp_auth(self, conn: _Connection, task_id: str) -> None:
@@ -916,19 +1127,25 @@ class ProfileTasks:
         task = self.store.get(task_id)
         if task is None:
             raise ValueError(f"unknown task {task_id}")
-        pending = task.get("pending_approval")
-        if not pending:
+        waiting = [a for a in _approvals(task).values() if a.get("stage") == "pending"]
+        if not waiting:
             last = task.get("last_approval")
             raise ValueError(f"task {task_id} has no pending approval"
                              + (f" (the last one ended: {last.get('outcome')})" if last else ""))
-        if time.time() >= pending["expires_at"]:
+        live = [a for a in waiting if time.time() < a["expires_at"]]
+        if not live:
             raise ValueError(f"the approval of task {task_id} has expired")
         from tools.approval import request_tool_approval
         from tools.approval_context import get_current_session_key
-        profile, prompt_id = task["profile"], pending["prompt_id"]
-        rule_key = f"{RELAY_RULE}:{prompt_id}"
-        relay = {"manager_key": get_current_session_key(), "rule": f"plugin_rule:{rule_key}", "choice": None}
+        manager_key = get_current_session_key()
         with self._relay_lock:
+            # The oldest request with no card open: a second card for one request would take the first card's answer.
+            pending = next((a for a in live if a["prompt_id"] not in self._relays), None)
+            if pending is None:
+                raise ValueError(f"the approval of task {task_id} is already open in a conversation; answer it there")
+            profile, prompt_id = task["profile"], pending["prompt_id"]
+            rule_key = f"{RELAY_RULE}:{prompt_id}"
+            relay = {"manager_key": manager_key, "rule": f"plugin_rule:{rule_key}", "choice": None}
             self._relays[prompt_id] = relay
         expires = time.strftime("%H:%M:%S", time.localtime(pending["expires_at"]))
         reason = (f"the {profile} task {task_id} asks to run: {pending['command']} ({pending['description']}). "
@@ -943,7 +1160,7 @@ class ProfileTasks:
                 note = ("No answer was given here" if choice in ("timeout", "cancelled") else
                         "This conversation's approvals are bypassed (yolo or approvals.mode off), so nobody "
                         "answered and nothing was passed on")
-                still = (self.store.get(task_id) or {}).get("pending_approval")
+                still = (_approvals(self.store.get(task_id) or {}).get(prompt_id) or {}).get("stage") == "pending"
                 return {"task_id": task_id, "forwarded": False, "manager_choice": choice,
                         "approved_here": bool(result.get("approved")),
                         "note": f"{note}. The request in the {profile} session is "
@@ -951,14 +1168,20 @@ class ProfileTasks:
             if choice != "deny" and choice not in pending["choices"]:
                 choice = "once"
             with self._relay_lock:
-                current = (self.store.get(task_id) or {}).get("pending_approval") or {}
-                if current.get("prompt_id") == prompt_id:
-                    relay["forwarded"] = True
-                    self.store.update(task_id, pending_approval={**current, "relayed": True,
-                                                                 "relayed_choice": choice})
+                current = _approvals(self.store.get(task_id) or {}).get(prompt_id) or {}
+                relay["forwarding"] = current.get("stage") == "pending"
             # The target request ended as the answer came in: nothing is sent to the target session.
-            answer = (self._run_async(self._respond(task, pending, choice)) if relay.get("forwarded") else
+            answer = (self._run_async(self._respond(task, pending, choice)) if relay["forwarding"] else
                       {"ok": False, "error": "the approval in the target session had already ended"})
+            # Marked forwarded only once the target took the answer: a failed forward keeps the outcome notice.
+            with self._relay_lock:
+                relay["forwarding"] = False
+                ended_notice = relay.pop("ended_notice", None)
+                if answer.get("ok"):
+                    relay["forwarded"] = True
+                    self.store.modify(task_id, lambda t: self._mark_relayed(t, prompt_id, choice))
+            if ended_notice and not answer.get("ok"):
+                self._notify(task_id, ended_notice, "approval_end")
         finally:
             with self._relay_lock:
                 self._relays.pop(prompt_id, None)
@@ -967,6 +1190,15 @@ class ProfileTasks:
                 "target_answer": answer,
                 "note": (f"Your {choice} was passed to the {profile} session; its final answer will arrive here."
                          if answer.get("ok") else f"The {profile} session did not take the answer: {answer}")}
+
+    @staticmethod
+    def _mark_relayed(task: dict, prompt_id: str, choice: str) -> dict | None:
+        """Fields that mark the open or settling approval *prompt_id* as answered from the manager, or None."""
+        approvals = _approvals(task)
+        if prompt_id not in approvals:
+            return None
+        approvals[prompt_id] = {**approvals[prompt_id], "relayed": True, "relayed_choice": choice}
+        return _approval_fields(approvals)
 
     async def _respond(self, task: dict, pending: dict, choice: str) -> dict:
         async with _Connection(self._home(task["profile"])) as conn:
@@ -977,6 +1209,9 @@ class ProfileTasks:
                                         prompt_id=pending["prompt_id"], choice=choice)
             except Exception as exc:  # noqa: BLE001 - returned to the manager as the outcome
                 return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+        # The gateway answers {"status": "already_resolved"} without raising when the prompt had already ended.
+        if not isinstance(result, dict) or result.get("status") != "resolved":
+            return {"ok": False, "error": "the request had already ended in the target session", "result": result}
         return {"ok": True, "result": result}
 
     @staticmethod
@@ -1058,20 +1293,32 @@ class ProfileTasks:
         with self._outbox_lock:
             self.store.modify(task_id, lambda t: {"outbox": [e for e in t.get("outbox") or [] if e["kind"] != kind]})
 
-    def _deliver(self, task_id: str, message: str, *, status: str, kind: str = "result", **fields: Any) -> None:
-        self.store.update(task_id, status=status, **({"delivered": False} if kind == "result" else {}), **fields)
+    def _deliver(self, task_id: str, message: str, *, status: str, kind: str = "result", turn: str | None = None,
+                 **fields: Any) -> None:
+        """Record *status* and *fields* and send *message*; with *turn*, only while that turn still owns the task."""
+        new = {"status": status, **({"delivered": False} if kind == "result" else {}), **fields}
+        if status in ("answered", "failed"):
+            # Nobody waits on a finished turn: a later load must not report it cut off by a restart.
+            new["waiter"] = None
+        owned = self.store.modify(task_id, lambda task: new if turn is None or task.get("turn_token") == turn else None)
+        if owned is None:
+            # A follow_up started a newer turn: its state stays; this notice is about the earlier turn only.
+            logger.info("profile-tasks: task %s: a newer turn owns the task; its earlier %s is sent as a notice only",
+                        task_id, kind)
+            kind = f"earlier_{kind}"
         self._notify(task_id, message, kind)
 
     def _drop_dead_approval(self, task_id: str, cause: str) -> str:
         """Clear an approval nobody can watch any more; return a sentence for the notice, or ''."""
         task = self.store.get(task_id) or {}
-        approval = task.get("pending_approval") or task.get("settling_approval")
-        if not approval:
+        approvals = list(_approvals(task).values())
+        if not approvals:
             return ""
-        self.store.update(task_id, pending_approval=None, settling_approval=None,
-                          last_approval={**approval, "outcome": "watch_lost", "user_summary": cause,
+        self.store.update(task_id, **_approval_fields({}),
+                          last_approval={**approvals[-1], "outcome": "watch_lost", "user_summary": cause,
                                          "settled_at": time.time()})
-        return (f" Its approval request for `{approval.get('command')}` can no longer be followed or answered from "
+        commands = ", ".join(f"`{a.get('command')}`" for a in approvals)
+        return (f" Its approval request for {commands} can no longer be followed or answered from "
                 f"here ({cause}); answer it in the {task.get('profile')} session if it is still open.")
 
     # gateway restart: found at load, told to each calling conversation
@@ -1093,16 +1340,16 @@ class ProfileTasks:
             return None
         # A stop can cut the wait (wait_lost) or end the approval watch just before the process exits.
         waiting = task.get("status") in WAITING or task.get("status") == "wait_lost"
-        approval = task.get("pending_approval") or task.get("settling_approval")
+        approvals = list(_approvals(task).values())
         last = task.get("last_approval") or {}
-        if last.get("outcome") == "watch_lost" or _ended_by_stop(task, last):
-            approval = approval or last
-        if not waiting and not approval:
+        if not approvals and (last.get("outcome") == "watch_lost" or _ended_by_stop(task, last)):
+            approvals = [last]
+        if not waiting and not approvals:
             return None
         profile, session_id = task.get("profile"), task.get("session_id")
         keyed = bool(task.get("key"))
         parts = [f"{_label(task_id, task)}: the gateway restarted"]
-        fields: dict = {"waiter": None, "pending_approval": None, "settling_approval": None}
+        fields: dict = {"waiter": None, **_approval_fields({})}
         if waiting and not (session_id and task.get("admission_id")):
             fields.update(status="failed", error="the gateway restarted before the target accepted the task")
             parts.append(" before the target accepted it. " + ("Send it again." if keyed else "Start it again."))
@@ -1117,10 +1364,10 @@ class ProfileTasks:
                          f"{session_id} still exists: {_session_ref(profile, session_id)}")
         else:
             parts.append(f" after the wait limit, while the {profile} session had an approval open.")
-        if approval:
+        for approval in approvals:
             fields["last_approval"] = {**approval, "outcome": "interrupted", "settled_at": time.time()}
-            parts.append(f" The approval for `{approval.get('command')}` ended with the restart: the command did "
-                         f"not run.")
+            parts.append(f" The approval for `{approval.get('command')}` ended with the restart: whether the command "
+                         f"ran is unknown; check the {profile} session before running it again.")
         fields["outbox"] = list(task.get("outbox") or []) + [_notice("".join(parts), "restart")]
         return fields
 
@@ -1211,13 +1458,21 @@ class ProfileTasks:
             if "answer" in row or "answer" in extra.get(tid, {}):
                 # This result hands the answer over; the queued injection of it would repeat it.
                 self._drop_notices(tid, "result")
-                row.pop("notices_not_delivered", None)
+                left = [e["text"] for e in t.get("outbox") or [] if e["kind"] != "result"]
+                if left:
+                    row["notices_not_delivered"] = left
+                else:
+                    row.pop("notices_not_delivered", None)
             rows.append(row | extra.get(tid, {}))
         return {"tasks": sorted(rows, key=lambda r: r.get("created_at") or 0), "targets": self.targets()}
 
     def _refresh(self, task: dict) -> dict:
         """Re-read the receipt of a task nobody waits for any more; record and return what it says."""
         task_id, profile, session_id = task["task_id"], task["profile"], task.get("session_id")
+        # The turn this read is about: a follow_up may start a newer one while the receipt is read.
+        turn = task.get("turn_token")
+        newer = {"note": "A follow_up started a newer turn of this task while the earlier one was read; that read "
+                         "is dropped. Check again with action=status."}
         restarted = task.get("status") in WAITING
         if restarted:
             restart_note = "The gateway restarted while this task was waiting, so no answer was injected. "
@@ -1228,8 +1483,8 @@ class ProfileTasks:
             restart_note = ""
         if not session_id or not task.get("admission_id"):
             error = "the gateway restarted before the target accepted the task" if restarted else "not accepted yet"
-            if restarted:
-                self.store.update(task_id, status="failed", error=error)
+            if restarted and not self._record(task_id, turn, status="failed", error=error):
+                return newer
             return {"note": f"{restart_note}The task was never accepted by {profile}. Start it again."}
         box: dict = {}
         context = contextvars.copy_context()
@@ -1245,22 +1500,26 @@ class ProfileTasks:
         thread.join(ACK_TIMEOUT_SECONDS)
         receipt = box.get("receipt")
         if receipt is None:
-            if restarted:
-                self.store.update(task_id, status="wait_lost")
+            if restarted and not self._record(task_id, turn, status="wait_lost"):
+                return newer
             return {"note": f"{restart_note}Could not read the turn's state from {profile}: "
                             f"{box.get('error', 'timed out')}. The {profile} session {session_id} still exists."}
         state = receipt.get("status")
         if state not in ("terminal", "unknown"):
-            if restarted or task.get("status") == "wait_lost":
-                self.store.update(task_id, status="waiting_timeout")
+            if ((restarted or task.get("status") == "wait_lost")
+                    and not self._record(task_id, turn, status="waiting_timeout")):
+                return newer
             return {"turn": state, "note": f"{restart_note}{profile} is still on it (turn {state}). The work is "
                                             f"not cancelled. Check back later with action=status."}
         ok, body = _final_text(receipt)
         if ok:
-            self.store.update(task_id, status="answered", last_answer=body, delivered=True, delivered_by="status")
+            if not self._record(task_id, turn, status="answered", last_answer=body, delivered=True,
+                                delivered_by="status"):
+                return newer
             return {"turn": state, "answer": body,
                     "note": f"{restart_note}Answer read from the {profile} session after the wait ended."}
-        self.store.update(task_id, status="failed", error=body, delivered=True, delivered_by="status")
+        if not self._record(task_id, turn, status="failed", error=body, delivered=True, delivered_by="status"):
+            return newer
         if state == "unknown":
             return {"turn": state, "note": (
                 f"{restart_note}Hermes marked the turn unknown: the gateway stopped while it ran, so it did "
@@ -1268,6 +1527,12 @@ class ProfileTasks:
                 f"resends or discards it in the desktop; a follow_up queues behind it until then.")}
         return {"turn": state, "note": f"{restart_note}The turn did not complete: {body}. The {profile} "
                                        f"session {session_id} still exists."}
+
+    def _record(self, task_id: str, turn: str | None, **fields: Any) -> bool:
+        """Store *fields* only while *turn* still owns the task; False when a follow_up started a newer turn."""
+        if fields.get("status") in ("answered", "failed"):
+            fields["waiter"] = None
+        return self.store.modify(task_id, lambda task: fields if task.get("turn_token") == turn else None) is not None
 
     async def _read_receipt(self, task: dict) -> dict:
         async with _Connection(self._home(task["profile"])) as conn:

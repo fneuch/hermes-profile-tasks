@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-PLUGIN = Path(__file__).resolve().parents[1] / "profile-tasks" / "__init__.py"
+PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
 
 
 def load():
@@ -80,7 +80,7 @@ def main() -> int:
                 "session_title": task["title"], "link": mod._session_ref(task["profile"], session_id), "note": "finish your turn"}
 
     plugin._send = fake_send
-    plugin._running_turn = lambda task: None
+    plugin._running_turn = lambda task, read=None: None
 
     first = mod.send("pr-1", "reviewer", "Q1", title="PR one")
     second = mod.send("pr-2", "reviewer", "Q2")
@@ -146,16 +146,16 @@ def main() -> int:
         "unknown key": raises(ValueError, mod.result, "pr-404"),
         "non-numeric wait": raises(ValueError, mod.result, "pr-1", wait="soon"),
     }
-    plugin._running_turn = lambda task: "turn started"
+    plugin._running_turn = lambda task, read=None: "turn started"
     errors["turn running"] = raises(ValueError, mod.send, "pr-2", "reviewer", "x")
-    plugin._running_turn = lambda task: None
+    plugin._running_turn = lambda task, read=None: None
     # A second send on a key whose first send is still being submitted (no session yet).
     plugin.store.update("t-start", task_id="t-start", profile="reviewer", key="pr-6", caller_session_key=None,
                         title="Task t-start", created_at=time.time(), status="starting", session_id=None, turns=[],
                         waiter=me)
-    plugin._running_turn = mod.ProfileTasks._running_turn.__get__(plugin)
+    plugin._running_turn = mod.ProfileTasks._running_turn
     errors["still starting"] = raises(ValueError, mod.send, "pr-6", "reviewer", "x")
-    plugin._running_turn = lambda task: None
+    plugin._running_turn = lambda task, read=None: None
     check(all(errors.values()) and "belongs to profile reviewer" in errors["other profile"]
           and "turn still running" in errors["still starting"] and "no session" not in errors["still starting"]
           and not plugin.task_for_key("pr-3") and not plugin.task_for_key("pr-4"),
@@ -196,7 +196,7 @@ def main() -> int:
     k7 = mod.send("pr-7", "reviewer", "Q7")["task_id"]
     plugin._approval_raised(k7, {"prompt_id": "p7", "command": "rm -rf x", "description": "recursive delete",
                                  "timeout_s": 10})
-    plugin._approval_ended(k7, ("timeout", ""))
+    plugin._approval_ended(k7, "p7", ("timeout", ""))
     plugin._mcp_auth_notice(k7, "jira7", "sign-in rejected")
     plugin._deliver(k7, mod._wait_limit_text(k7, plugin.store.get(k7), 30.0), status="waiting_timeout",
                     kind="wait_limit")

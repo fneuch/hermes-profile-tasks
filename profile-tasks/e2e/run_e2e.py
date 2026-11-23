@@ -204,7 +204,7 @@ def write_home(manager_url: str, analyst_url: str, remote: dict[str, str]) -> No
         (homes[name] / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
         (homes[name] / ".env").write_text("OPENAI_API_KEY=sk-fake-e2e\n", encoding="utf-8")
     (HH / "plugins").mkdir(exist_ok=True)
-    (HH / "plugins/profile-tasks").symlink_to(REPO / "profile-tasks")
+    (HH / "plugins/profile-tasks").symlink_to(REPO)
     (HH / "plugins/pt-probe").symlink_to(REPO / "e2e/probe-plugin")
     EVIDENCE["configs"] = {"default": default, "analyst": analyst, "implementer": implementer}
 
@@ -227,6 +227,9 @@ class _Unauthorized(BaseHTTPRequestHandler):
 
 
 def _die_with_parent() -> None:
+    # Linux only: elsewhere the fixture is stopped by stop_remote_mcp, not by the parent's death.
+    if sys.platform != "linux":
+        return
     import ctypes
     ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
 
@@ -375,6 +378,20 @@ def manager_got(server: FakeLLMServer, needle: str) -> str | None:
         if last.get("role") == "user" and needle in text_of(last):
             return text_of(last)
     return None
+
+
+REVIEW_PROMPT_START = "Review the conversation above and "
+
+
+def conversation_turns(server: FakeLLMServer) -> list[dict]:
+    """Main model requests, without Hermes's background memory/skill review of an earlier session.
+
+    That review runs after a session's last turn, on its own clock, so it can land inside a later trial.
+    """
+    def is_review(body: dict) -> bool:
+        users = [m for m in body.get("messages") or [] if m.get("role") == "user"]
+        return bool(users) and text_of(users[-1]).startswith(REVIEW_PROMPT_START)
+    return [body for body in server.main_requests() if not is_review(body)]
 
 
 def manager_saw(server: FakeLLMServer, needle: str) -> str | None:
@@ -563,6 +580,8 @@ async def trial_approval(ctx) -> None:
                   and "action=approval" in notice and (how != "expire" or ended_at - notice_at > APPROVAL_TIMEOUT - 3),
                   f"approval then {how}: the manager got the command, task, session and link while it was answerable",
                   notice=notice, seconds_notice_before_ending=round(ended_at - notice_at, 1))
+            # An interrupted command may have run; a cancelled one did not.
+            words = "whether it ran is unknown" if stored.get("outcome") == "interrupted" else words
             check("approval", stored.get("outcome") in outcomes and words in ended
                   and probe.exists() == probe_stays,
                   f"approval then {how} in the analyst session: the manager is told the real ending "
@@ -776,7 +795,7 @@ async def probe(op: str, **args) -> dict:
 async def trial_keyed(ctx) -> None:
     """send/result from a plugin backend: one session per key, follow-ups reuse it, the answer is returned."""
     a, b = "desk-pr-" + uuid.uuid4().hex[:6], "desk-pr-" + uuid.uuid4().hex[:6]
-    before = len(ctx["m"].main_requests())
+    before = len(conversation_turns(ctx["m"]))
     first = await probe("send", key=a, profile="analyst", text="SCENARIO:KEYEDA1 first question", title="PR A")
     second = await probe("send", key=b, profile="analyst", text="SCENARIO:KEYEDB1 other question", title="PR B")
     check("keyed", first.get("accepted") is True and second.get("accepted") is True
@@ -804,9 +823,11 @@ async def trial_keyed(ctx) -> None:
           "both key sessions are in the analyst profile's default session list (visible, not hidden)",
           listed=[r for r in rows or [] if r.get("id") in (first["session_id"], second["session_id"])])
     injected = manager_saw(ctx["m"], "KEYED-ANSWER")
-    check("keyed", not injected and len(ctx["m"].main_requests()) == before,
+    after = len(conversation_turns(ctx["m"]))
+    check("keyed", not injected and after == before,
           "nothing reached a manager conversation: no injection, no manager turn",
-          manager_requests_during_trial=len(ctx["m"].main_requests()) - before)
+          manager_requests_during_trial=after - before,
+          background_reviews_in_run=len(ctx["m"].main_requests()) - after)
 
 
 async def trial_9(ctx) -> None:
@@ -996,7 +1017,7 @@ async def trial_restart(ctx) -> None:
             check("restart", pending.get("prompt_id") and not approval_after.get("pending_approval")
                   and not approval_after.get("settling_approval")
                   and (approval_after.get("last_approval") or {}).get("outcome") in ("interrupted", "cancelled")
-                  and "did not run" in told[1],
+                  and "whether the command ran is unknown" in told[1],
                   f"gateway {how} restart with an approval open: the stale approval is cleared at load and the "
                   f"manager is told it ended with the restart",
                   pending_before=pending, last_approval=approval_after.get("last_approval"),
@@ -1107,6 +1128,8 @@ TRIALS = {"1-2-3": trial_1_2_3, "4": trial_4, "5": trial_5, "6": trial_6, "7": t
           "followup": trial_followup, "retry": trial_notice_retry, "mcp_auth": trial_mcp_auth, "keyed": trial_keyed,
           # Last: its 'always' relay permanently allows recursive delete in the analyst profile.
           "approval": trial_approval}
+# Trials that cannot pass in the isolated run (no desktop app): run only when named.
+BY_NAME_ONLY = {"9"}
 
 
 async def main(selected: list[str]) -> int:
@@ -1123,7 +1146,7 @@ async def main(selected: list[str]) -> int:
             log("gateway ready, served profiles:", served)
             EVIDENCE["served_profiles"] = served
             for name, trial in TRIALS.items():
-                if selected and name not in selected:
+                if (name not in selected) if selected else (name in BY_NAME_ONLY):
                     continue
                 log("=== trial", name)
                 try:
@@ -1139,6 +1162,9 @@ async def main(selected: list[str]) -> int:
             out.parent.mkdir(exist_ok=True)
             out.write_text(json.dumps(EVIDENCE, indent=2, default=str), encoding="utf-8")
             log("evidence:", out)
+    if not EVIDENCE["checks"]:
+        log("no check ran, unknown trial name:", selected)
+        return 1
     return 0 if all(c["ok"] for c in EVIDENCE["checks"]) else 1
 
 

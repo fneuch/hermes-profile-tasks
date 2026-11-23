@@ -20,7 +20,12 @@ REAL_HERMES = (REAL_HOME / ".hermes").resolve()
 
 
 def alive(pid: int) -> bool:
-    return Path(f"/proc/{pid}").exists() and "zombie" not in Path(f"/proc/{pid}/status").read_text().lower()
+    import psutil  # a Hermes dependency; reads the process on Linux and macOS
+    try:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        # The gateway exited, possibly while it was being read.
+        return False
 
 
 def stop(home: Path, wait: float = 90.0) -> bool:

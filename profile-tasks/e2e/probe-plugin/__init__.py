@@ -30,7 +30,10 @@ def _serve(box: Path) -> None:
                 out = {"ok": False, "error": f"{exc.__class__.__name__}: {exc}", "trace": traceback.format_exc()}
             out["modules"] = sorted(m for m in sys.modules if m.startswith(MODULE))
             request.unlink()
-            response.write_text(json.dumps(out, default=str))
+            # Renamed into place: the trial reads the response as soon as its path exists.
+            partial = response.with_suffix(".part")
+            partial.write_text(json.dumps(out, default=str))
+            partial.replace(response)
         time.sleep(0.2)
 
 
