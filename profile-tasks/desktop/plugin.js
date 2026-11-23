@@ -1,5 +1,5 @@
 // profile-tasks: a status-bar item for the background tasks of the conversation open on screen.
-// The item shows the send mark and the number of profile_task tasks started from that conversation; it is hidden
+// The item shows a speech bubble and the number of profile_task tasks started from that conversation; it is hidden
 // when there are none. Clicking it opens the list: target profile, title and state (running, waiting for an
 // approval, past the wait limit, answered, late answer, failed). Each entry opens the task's session in a tab, as
 // the @session:<profile>/<id> chip does.
@@ -156,7 +156,7 @@ function ProfileTasksStatus() {
             font: 'inherit'
           }
         },
-        h(Codicon, { name: 'send', size: 14 }),
+        h(Codicon, { name: 'comment', size: 14 }),
         String(tasks.length)
       )
     ),

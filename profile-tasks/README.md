@@ -114,7 +114,7 @@ profile served by the same Hermes gateway.
 The package also has a desktop part (`desktop/plugin.js`) and a read-only backend route
 (`dashboard/plugin_api.py`), installed with the plugin.
 
-- In the status bar (right side), the send mark and the number of `profile_task` tasks started from
+- In the status bar (right side), a speech bubble and the number of `profile_task` tasks started from
   the conversation open on screen. The item is hidden when that conversation started none, and it
   changes with the open conversation. It turns yellow while a task waits for an approval.
 - Clicking it lists those tasks, newest first: target profile, title and state: running, waiting
@@ -175,8 +175,9 @@ Linux only in the e2e harness: the remote MCP fixture also dies with the harness
    hermes plugins install fneuch/hermes-profile-tasks/profile-tasks --enable
    ```
 
-   Only this folder is installed, its desktop part and backend route included; the desktop
-   publishes the desktop part on its next start. In the desktop, Skills > Plugins > Install from Git takes
+   Only this folder is installed, its desktop part and backend route included. The app copies the
+   desktop part when it reloads: after the install, restart the gateway and reload the app (Ctrl+R).
+   In the desktop, Skills > Plugins > Install from Git takes
    `fneuch/hermes-profile-tasks#profile-tasks`.
 
 2. In `~/.hermes/config.yaml`:
@@ -192,11 +193,11 @@ Linux only in the e2e harness: the remote MCP fixture also dies with the harness
 
 3. The gateway must serve the target profiles (`gateway.multiplex_profiles: true`, already the case
    when the desktop shows several profiles).
-4. Restart the gateway.
+4. Restart the gateway, then reload the app (Ctrl+R).
 
 Nothing is needed in the target profiles.
 
-Update with `hermes plugins update profile-tasks`, then restart the gateway.
+Update with `hermes plugins update profile-tasks`, then restart the gateway and reload the app (Ctrl+R).
 
 ## Tests
 
