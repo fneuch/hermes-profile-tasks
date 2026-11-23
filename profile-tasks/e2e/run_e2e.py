@@ -423,7 +423,12 @@ def offered_mcp(body: dict) -> list[str]:
 
 async def manager_session(mgr: Client) -> str:
     snap = await mgr.rpc("session.create", source="gui", request_id=uuid.uuid4().hex)
+    STORED_IDS[snap["session_id"]] = snap.get("stored_session_id")
     return snap["session_id"]
+
+
+# Runtime session id -> the stored session id the desktop keeps for it (host.state.focusedStoredSessionId).
+STORED_IDS: dict[str, str | None] = {}
 
 
 async def say(mgr: Client, sid: str, text: str) -> dict:
@@ -446,6 +451,14 @@ async def trial_1_2_3(ctx) -> None:
         task_id = ack.get("task_id")
         check("2", ack.get("accepted") is True and ack.get("session_id"), "tool returns at once with task id, "
               "profile, session id and title", ack=ack, ack_seconds=ack_seconds)
+        recorded = plugin_task(task_id).get("caller_session_id")
+        check("2", recorded and recorded == STORED_IDS.get(sid), "the task records the calling conversation's "
+              "stored session id, the one the desktop status-bar item asks for", recorded=recorded,
+              stored_session_id=STORED_IDS.get(sid))
+        changed = [f for f in mgr.frames if f.get("type") == "plugin.profile-tasks.tasks.changed"]
+        check("2", any((f.get("payload") or {}).get("task_id") == task_id for f in changed),
+              "the desktop client received plugin.profile-tasks.tasks.changed for the task",
+              frames=changed[:3])
         wake = await until(lambda: manager_got(ctx["m"], f"for task {task_id}"), 90, "wake message")
         check("2", CANARY in wake, "the forwarded task came back from a plugin thread inside the gateway",
               wake_message=wake[:400])

@@ -1,6 +1,6 @@
 name: profile-tasks
 version: "0.1.0"
-description: Lets the manager hand a task to another profile served by the same Hermes gateway. Each task runs in its own session under the target profile, with that profile's config, MCP servers and tokens; the final answer comes back once into the calling conversation.
+description: Lets the manager hand a task to another profile served by the same Hermes gateway. Each task runs in its own session under the target profile, with that profile's config, MCP servers and tokens; the final answer comes back once into the calling conversation. A desktop status-bar item lists the tasks of the open conversation.
 provides_tools:
   - profile_task
 provides_hooks:

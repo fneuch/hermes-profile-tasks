@@ -109,6 +109,29 @@ profile served by the same Hermes gateway.
   `_manager`. If an update removed one, it logs an error naming it and the tool refuses every call
   with that message.
 
+## Desktop status-bar item
+
+The package also has a desktop part (`desktop/plugin.js`) and a read-only backend route
+(`dashboard/plugin_api.py`), installed with the plugin.
+
+- In the status bar (right side), the send mark and the number of `profile_task` tasks started from
+  the conversation open on screen. The item is hidden when that conversation started none, and it
+  changes with the open conversation. It turns yellow while a task waits for an approval.
+- Clicking it lists those tasks, newest first: target profile, title and state: running, waiting
+  for an approval (with the command), past the wait limit, wait lost, answered, late answer (read
+  with `status` after the wait ended) or failed. Clicking a task opens its session in a tab, as the
+  `@session:<profile>/<id>` chip does.
+- Each task records its calling conversation's session id (`caller_session_id`, the desktop's
+  stored session id) at `start` and on a `follow_up` from another conversation. Tasks started before
+  this field existed and keyed tasks are not listed.
+- `GET /api/plugins/profile-tasks/tasks?session_id=<id>&session_profile=<profile>` returns that
+  list from the named profile's plugin state file as it is on disk: no write, no lock, no call to
+  a target (unlike `action=status`, which refreshes and records). The item reads it again when the
+  open conversation changes, on the `plugin.profile-tasks.tasks.changed` event the gateway sends on
+  every task save, and every 60 s.
+- By design the route reads the named profile's state, across the profile boundary: a row only
+  comes back to a caller that already knows that conversation's session id.
+
 ## From a plugin backend (no calling conversation)
 
 Code running in the gateway process (a dashboard plugin backend, for example) calls the module the
@@ -152,7 +175,8 @@ Linux only in the e2e harness: the remote MCP fixture also dies with the harness
    hermes plugins install fneuch/hermes-profile-tasks/profile-tasks --enable
    ```
 
-   Only this folder is installed. In the desktop, Skills > Plugins > Install from Git takes
+   Only this folder is installed, its desktop part and backend route included; the desktop
+   publishes the desktop part on its next start. In the desktop, Skills > Plugins > Install from Git takes
    `fneuch/hermes-profile-tasks#profile-tasks`.
 
 2. In `~/.hermes/config.yaml`:
@@ -201,6 +225,11 @@ only read (code and interpreter).
   target had already ended is not reported as forwarded, two approvals open in one session each
   end on their own call, a failure after the 120 s acknowledgement wait is recorded, a new turn
   drops the earlier turn's open calls, a finished task is not reported cut off at the next load.
+- `PT_SCRIPT=tests/test_status_item.py e2e/run.sh`: the status-bar item's data: `caller_session_id`
+  set at `start`, moved by a `follow_up` from another conversation, none on a keyed task; each
+  stored status mapped to the item's state; `GET /tasks` lists only the conversation's own tasks
+  from the named profile's state file and leaves that folder byte for byte as it was; a task save
+  sends `plugin.profile-tasks.tasks.changed` only where the gateway server runs.
 - `PT_SCRIPT=tests/test_liveness.py e2e/run.sh`: the waiting-process check with `/proc` (Linux) and
   with `/proc` hidden (the macOS path): a live waiter, a reused pid, a gone pid, a zombie.
 - `PT_SCRIPT=tests/test_e2e_harness.py e2e/run.sh`: the probe plugin's response is never read half

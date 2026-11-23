@@ -1,0 +1,9 @@
+{
+  "name": "profile-tasks",
+  "label": "Profile tasks",
+  "description": "Read-only list of the profile_task tasks started from one conversation, for the desktop status-bar item",
+  "icon": "Send",
+  "version": "0.1.0",
+  "tab": { "path": "/profile-tasks", "hidden": true },
+  "api": "plugin_api.py"
+}

@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -30,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 TOOL_NAME = "profile_task"
 TOOLSET = "profile_tasks"
+PLUGIN_ID = "profile-tasks"
+# Sent on every task save; the desktop receives it as plugin.profile-tasks.tasks.changed.
+CHANGED_EVENT = "tasks.changed"
 STATE_KEY = "tasks"
 DEFAULT_WAIT_SECONDS = 1800
 ACK_TIMEOUT_SECONDS = 120
@@ -98,7 +102,7 @@ def check_internals(ctx: Any = None) -> list[str]:
     if state is not None and not hasattr(getattr(state, "PluginState", None), "data_dir"):
         missing.append("hermes_cli.plugins_state.PluginState.data_dir")
     need("hermes_constants", ("get_hermes_home",))
-    need("gateway.session_context", ("bound_session_key",))
+    need("gateway.session_context", ("bound_session_key", "get_session_env"))
     need("tools.approval", ("request_tool_approval", "list_gateway_approvals", "withdraw_gateway_approval"))
     need("tools.approval_context", ("get_current_session_key",))
     need("agent.i18n", ("supported_languages", "t"))
@@ -184,6 +188,24 @@ def _summary_outcome(summary: str) -> str:
 # ---- state ------------------------------------------------------------------------------------
 
 
+def _caller_session_id() -> str | None:
+    """The calling conversation's durable session id (the desktop's stored session id), or None."""
+    from gateway.session_context import get_session_env
+    return get_session_env("HERMES_SESSION_ID") or None
+
+
+def _announce(task_id: str) -> None:
+    """Tell the desktop's status-bar item (desktop/plugin.js) that a task changed, so it reads the list again."""
+    # Only a process already serving desktop clients delivers it; importing the gateway server elsewhere is costly.
+    if "tui_gateway.server" not in sys.modules:
+        return
+    try:
+        from hermes_cli.plugin_events import broadcast_plugin_event
+        broadcast_plugin_event(PLUGIN_ID, CHANGED_EVENT, {"task_id": task_id})
+    except Exception as exc:  # noqa: BLE001 - the item also reads the list on a slow poll
+        logger.debug("profile-tasks: change event for %s not sent: %s", task_id, exc)
+
+
 class TaskStore:
     """Tasks kept in the plugin's durable state, one dict per task id."""
 
@@ -214,7 +236,8 @@ class TaskStore:
             task.update(fields, updated_at=time.time())
             tasks[task_id] = task
             self._state.set(STATE_KEY, tasks)
-            return task
+        _announce(task_id)
+        return task
 
     @contextlib.contextmanager
     def _locked(self):
@@ -623,7 +646,8 @@ class ProfileTasks:
         task_id = "t-" + uuid.uuid4().hex[:8]
         label = f"Task {task_id}" + (f": {title.strip()[:80]}" if title and title.strip() else "")
         self.store.update(task_id, task_id=task_id, profile=profile, caller_session_key=caller_key,
-                          title=label, created_at=time.time(), status="starting", session_id=None, turns=[],
+                          caller_session_id=_caller_session_id() if caller_key else None, title=label,
+                          created_at=time.time(), status="starting", session_id=None, turns=[],
                           waiter=_process_token(os.getpid()), turn_token=uuid.uuid4().hex,
                           **({"key": key} if key else {}))
         return task_id
@@ -708,7 +732,10 @@ class ProfileTasks:
             fields = {"status": "starting", "last_answer": None, "error": None, "admission_id": None,
                       "waiter": _process_token(os.getpid()), "turn_token": uuid.uuid4().hex}
             if not keyed:
-                fields["caller_session_key"] = bound_session_key() or task["caller_session_key"]
+                bound = bound_session_key()
+                fields["caller_session_key"] = bound or task["caller_session_key"]
+                # Without a bound key the session id could come from another conversation's os.environ.
+                fields["caller_session_id"] = (bound and _caller_session_id()) or task.get("caller_session_id")
             with self._turn_lock:
                 self.store.update(task_id, **fields)
         return self._send(task_id, text, create=False)
