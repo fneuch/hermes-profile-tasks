@@ -146,15 +146,14 @@ Hermes dependency) on macOS. The tests run on Linux; they cover the macOS path b
 Linux only in the e2e harness: the remote MCP fixture also dies with the harness process
 (`PR_SET_PDEATHSIG`); elsewhere the harness stops it on exit only.
 
-1. Clone this repo (private: `gh` signed in as an account with access), then link (or copy) this
-   folder into the default profile's plugin folder and enable it:
+1. Install and enable the plugin in the default profile:
 
    ```bash
-   gh repo clone fneuch/hermes-profile-tasks
-   mkdir -p ~/.hermes/plugins
-   ln -s "$PWD/hermes-profile-tasks/profile-tasks" ~/.hermes/plugins/profile-tasks
-   hermes plugins enable profile-tasks
+   hermes plugins install fneuch/hermes-profile-tasks/profile-tasks --enable
    ```
+
+   Only this folder is installed. In the desktop, Skills > Plugins > Install from Git takes
+   `fneuch/hermes-profile-tasks#profile-tasks`.
 
 2. In `~/.hermes/config.yaml`:
 
@@ -172,6 +171,8 @@ Linux only in the e2e harness: the remote MCP fixture also dies with the harness
 4. Restart the gateway.
 
 Nothing is needed in the target profiles.
+
+Update with `hermes plugins update profile-tasks`, then restart the gateway.
 
 ## Tests
 
