@@ -98,6 +98,7 @@ def main() -> int:
     check(all(want == state for want, state in got.items()), "each stored status maps to the item's state; an "
           "answer read through status after the wait ended is a late answer; an open approval wins", got=got)
     check(api.task_state({"status": "waiting_timeout", "pending_approval": {"command": "x"}}) == "approval"
+          and api.task_state({"status": "waiting_subwork", "pending_approval": {"command": "x"}}) == "approval"
           and api.task_state({"status": "answered", "pending_approval": {"command": "x"}}) == "answered",
           "an approval counts only while the turn may still run")
 

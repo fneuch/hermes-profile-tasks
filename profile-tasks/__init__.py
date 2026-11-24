@@ -446,11 +446,12 @@ class _Observer:
             kind = frame.get("type")
             payload = frame.get("payload") or {}
             if kind == "message.complete":
-                self.busy = False
                 try:
                     await self.plugin._turn_ended(self.task_id, frame, self)
                 except Exception:  # noqa: BLE001 - one turn's handling must not end the observation
                     logger.warning("profile-tasks: end of a turn of task %s not handled", self.task_id, exc_info=True)
+                # Busy until the end is handled, so no follow_up starts a turn while it is.
+                self.busy = False
                 self.conn.completed(frame)
             elif kind in TURN_ACTIVITY:
                 self.busy = True
@@ -473,7 +474,7 @@ class _Observer:
     async def idle(self) -> None:
         """Keep reading until stopped; give up a paused task at its follow limit. Raises what ended the pump."""
         while self._pump_task is not None and not self._stop.is_set():
-            wait = 1.0 if self.deadline is None else max(0.0, min(1.0, self.deadline - time.monotonic()))
+            wait = 1.0 if self.deadline is None or self.busy else max(0.0, min(1.0, self.deadline - time.monotonic()))
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(wait):
                     await self._stop.wait()
@@ -1171,7 +1172,7 @@ class ProfileTasks:
         status = payload.get("status") or "complete"
         text = payload.get("text")
         text = text if isinstance(text, str) else ("" if text is None else json.dumps(text))
-        self.store.update(task_id, told_text=text)
+        self.store.update(task_id, told_text=text, told_at=time.time())
         failure = ""
         if status != "complete":
             cause = payload.get("error") or payload.get("failure_reason") or status
@@ -1452,14 +1453,17 @@ class ProfileTasks:
         """The notice and the ``last_approval`` record of an approval that ended with *outcome*."""
         name, summary = outcome
         settled = approval.get("settled_at") or time.time()
+        # An approval recorded without its raise time (e.g. by an older version) has no duration.
+        raised = approval.get("raised_at")
         record = {**approval, "outcome": name, "user_summary": summary,
-                  "settled_after_s": round(settled - approval["raised_at"], 1)}
+                  "settled_after_s": round(settled - raised, 1) if raised else None}
+        after = f" after {record['settled_after_s']} s" if raised else ""
         profile, session_id = task.get("profile"), task.get("session_id")
         what = {
             "ran": f"was approved in the {profile} session; the command ran",
             "denied": f"was denied in the {profile} session; the command did not run",
-            "timeout": (f"expired unanswered after {record['settled_after_s']} s (the {profile} profile's "
-                        f"approvals.timeout is {round(approval['timeout_s'])} s); the command did not run"),
+            "timeout": (f"expired unanswered{after} (the {profile} profile's "
+                        f"approvals.timeout is {round(approval.get('timeout_s') or 0)} s); the command did not run"),
             "cancelled": "was withdrawn before anyone answered (the turn was interrupted or corrected); the "
                          "command did not run",
             "interrupted": (f"ended with the {profile} turn before the command reported back; whether it ran is "
@@ -1747,10 +1751,31 @@ class ProfileTasks:
                  **fields: Any) -> None:
         """Record *status* and *fields* and send *message*; with *turn*, only while that turn still owns the task."""
         new = {"status": status, **({"delivered": False} if kind == "result" else {}), **fields}
-        if status in ("answered", "failed"):
+        final = status in ("answered", "failed")
+        if final:
             # Nobody waits on a finished turn: a later load must not report it cut off by a restart.
             new["waiter"] = None
-        owned = self.store.modify(task_id, lambda task: new if turn is None or task.get("turn_token") == turn else None)
+        told = {}
+        # The end and its queued notice are one write: status then finds the notice to take, never an empty outbox.
+        queued = final and kind == "result" and not (self.store.get(task_id) or {}).get("key")
+        entry = _notice(message, kind)
+
+        def change(task: dict) -> dict | None:
+            if final and task.get("status") in ("answered", "failed") and task.get("delivered_by") == "status":
+                # status already handed this end to the manager; checked under the same lock as status writes it.
+                told["by_status"] = True
+                return None
+            if turn is not None and task.get("turn_token") != turn:
+                return None
+            return {**new, "outbox": list(task.get("outbox") or []) + [entry]} if queued else new
+
+        with self._outbox_lock:
+            owned = self.store.modify(task_id, change)
+        if told:
+            return
+        if owned is not None and queued:
+            self._flush_task(task_id, "event")
+            return
         if owned is None:
             # A follow_up started a newer turn: its state stays; this notice is about the earlier turn only.
             logger.info("profile-tasks: task %s: a newer turn owns the task; its earlier %s is sent as a notice only",
@@ -1909,7 +1934,9 @@ class ProfileTasks:
     async def _steer(self, task: dict, text: str) -> Any:
         observer = self._live_observer(task["task_id"]) if task.get("task_id") else None
         if observer is not None:
-            return await asyncio.wrap_future(observer.submit(lambda conn: self._steer_on(conn, task, text)))
+            # A turn started by an injection or a queued prompt is known to the observer before the task records it.
+            current = {**task, "admission_id": observer.turn_admission or task["admission_id"]}
+            return await asyncio.wrap_future(observer.submit(lambda conn: self._steer_on(conn, current, text)))
         async with _Connection(self._home(task["profile"])) as conn:
             return await self._steer_on(conn, task, text)
 
@@ -1983,7 +2010,8 @@ class ProfileTasks:
                             f"so no answer was injected. ")
         else:
             restart_note = ""
-        if task.get("status") == "follow_lost":
+        if task.get("status") == "follow_lost" or (task.get("status") == "wait_lost" and task.get("pause_reasons")):
+            # Nobody follows the paused session any more: read its latest turn, not the paused turn's receipt.
             return self._refresh_lost(task, turn)
         if not session_id or not task.get("admission_id"):
             error = "the gateway restarted before the target accepted the task" if restarted else "not accepted yet"
@@ -2016,6 +2044,11 @@ class ProfileTasks:
             return {"turn": state, "note": f"{restart_note}{profile} is still on it (turn {state}). The work is "
                                             f"not cancelled. Check back later with action=status."}
         ok, body = _final_text(receipt)
+        reasons = self._pause_reasons(task, body if ok else "")
+        if reasons:
+            # Not the real end: an update only; the observer, or a later status, takes the next turns.
+            return {"turn": state, "update": body, "waiting_on": reasons,
+                    "note": f"{restart_note}{profile} is not finished: it is waiting on {', '.join(reasons)}."}
         if ok:
             closed = (self.store.get(task_id) or {}).get("status") in ("answered", "failed")
             if closed or not self._record(task_id, turn, open_only=True, status="answered", last_answer=body,
@@ -2062,9 +2095,20 @@ class ProfileTasks:
         last = next((m for m in reversed(resumed.get("messages") or [])
                      if isinstance(m, dict) and m.get("role") == "assistant"), None)
         body = str((last or {}).get("text") or (last or {}).get("content") or "")
-        if info.get("running") is False and body.strip() and body != task.get("told_text"):
-            if self._record(task_id, turn, status="answered", last_answer=body, delivered=True,
-                            delivered_by="status", told_text=body):
+        stamp = (last or {}).get("timestamp")
+        # A turn is new when written after the last one told; the text decides without a timestamp or told time.
+        newer = (stamp > task["told_at"] if isinstance(stamp, (int, float)) and task.get("told_at")
+                 else body != task.get("told_text"))
+        if info.get("running") is False and body.strip() and newer:
+            reasons = self._pause_reasons(task, body)
+            if reasons:
+                # Still not the real end: told once as an update, the task stays past its follow limit.
+                if self._record(task_id, turn, open_only=True, last_update=body, pause_reasons=reasons,
+                                told_text=body, told_at=stamp or time.time()):
+                    return {**out, "update": body, "waiting_on": reasons, "note": "A later turn of the session ended "
+                            f"after the follow limit; it is still waiting on {', '.join(reasons)}."}
+            elif self._record(task_id, turn, status="answered", last_answer=body, delivered=True,
+                              delivered_by="status", told_text=body, told_at=stamp or time.time()):
                 return {**out, "answer": body, "note": "A later turn of the session ended after the follow "
                         "limit; this is its last answer."}
         if info.get("running"):
@@ -2084,6 +2128,8 @@ class ProfileTasks:
         thread = threading.Thread(target=contextvars.copy_context().run, args=(run,), daemon=True)
         thread.start()
         thread.join(ACK_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            raise TimeoutError(f"no reply in {ACK_TIMEOUT_SECONDS}s")
         if "error" in box:
             raise box["error"]
 

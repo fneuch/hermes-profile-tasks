@@ -47,7 +47,8 @@ def task_state(task: dict) -> str:
     records it with ``delivered_by: status``.
     """
     status = task.get("status")
-    if task.get("pending_approval") and status in ACTIVE:
+    # A turn of a paused task (started by an injection) can raise an approval too.
+    if task.get("pending_approval") and status in (*ACTIVE, "waiting_subwork"):
         return "approval"
     if status in ("starting", "running"):
         return "running"

@@ -548,6 +548,7 @@ def main() -> int:
           and not any("boom" in t for t in ctx.injected[n:]),
           "a failure handed over by status is not injected again when the end frame arrives", row=row,
           injected=ctx.injected[n:])
+    check(wait_for(lambda: plugin._live_observer(task_id) is None), "the observer closes after that failed turn end")
     task_id, adm = new_task()
     wait_for(lambda: plugin.store.get(task_id)["status"] == "waiting_timeout", 15)
     n = len(ctx.injected)
@@ -556,7 +557,197 @@ def main() -> int:
     injected = [t for t in ctx.injected[n:] if "answer after the limit" in t]
     check(len(injected) == 1 and plugin.store.get(task_id)["status"] == "answered",
           "past the wait limit with no status call, the turn's end injects the answer once", injected=ctx.injected[n:])
+
+    # 16. Past the wait limit, a receipt whose turn ends with WAITING: is an update for status, not the answer.
+    task_id, adm = new_task()
+    wait_for(lambda: plugin.store.get(task_id)["status"] == "waiting_timeout", 15)
+    gw.done[adm] = "half done\nWAITING: CI"
+    gw.running = False
+    row = plugin.status(task_id)["tasks"][0]
+    check(row["status"] == "waiting_timeout" and "answer" not in row and row.get("waiting_on") == ["CI"],
+          "status does not take a paused turn's receipt for the answer", row=row)
+    n = len(ctx.injected)
+    gw.emit("message.complete", text="half done\nWAITING: CI", status="complete", admission_id=adm)
+    wait_for(lambda: plugin.store.get(task_id)["status"] == "waiting_subwork")
+    check(plugin._live_observer(task_id) is not None and "Update from implementer" in last_text(),
+          "the observer keeps following the paused task", injected=ctx.injected[n:])
     ctx.config.pop("wait_timeout_seconds")
+
+    # 16b. The observer is busy until a turn's end is handled.
+    seen = {}
+    real_turn_ended = plugin._turn_ended
+
+    async def spy_turn_ended(tid, frame, observer):
+        seen.setdefault("busy", observer.busy)
+        return await real_turn_ended(tid, frame, observer)
+
+    plugin._turn_ended = spy_turn_ended
+    observer = plugin._live_observer(task_id)
+    gw.start_injected("inj-b")
+    wait_for(lambda: observer.busy)
+    gw.end_turn("inj-b", "more\nWAITING: CI")
+    wait_for(lambda: "busy" in seen)
+    del plugin._turn_ended
+    check(seen.get("busy") is True and wait_for(lambda: not observer.busy),
+          "the observer stays busy while a turn's end is handled", seen=seen)
+
+    # 16c. A busy observer past its pause deadline still sleeps between checks.
+    waits = {"n": 0}
+    real_wait = observer._stop.wait
+
+    async def counting_wait():
+        waits["n"] += 1
+        return await real_wait()
+
+    observer._stop.wait = counting_wait
+    observer.busy, observer.deadline = True, time.monotonic() - 1
+    time.sleep(0.5)
+    check(waits["n"] <= 3, "a busy observer past its deadline does not spin", waits=waits["n"])
+    observer.busy, observer.deadline = False, None
+
+    # 16d. correct during a turn started by an injection steers that turn.
+    gw.start_injected("inj-c")
+    wait_for(lambda: observer.turn_admission == "inj-c")
+    calls = len(gw.calls)
+    fixed = plugin.correct(task_id, "use the other branch")
+    receipts = [p.get("admission_id") for _, m, p in gw.calls[calls:] if m == "prompt.receipt"]
+    check(receipts == ["inj-c"] and "session.steer" in [m for _, m, _ in gw.calls[calls:]],
+          "correct reads the receipt of the injected turn and steers it", receipts=receipts, result=fixed)
+    gw.end_turn("inj-c", "done\nWAITING: CI")
+    wait_for(lambda: not observer.busy)
+    close_task(task_id)
+
+    # 16e. An end status already handed over is not delivered again, decided under the store's lock.
+    task_id, adm = new_task()
+    close_task(task_id)
+    plugin.store.update(task_id, status="answered", delivered=True, delivered_by="status", last_answer="x")
+    n = len(ctx.injected)
+    plugin._deliver(task_id, "Answer again", status="answered", last_answer="x")
+    check(len(ctx.injected) == n and plugin.store.get(task_id)["delivered_by"] == "status",
+          "the observer's end is dropped when status already recorded it", injected=ctx.injected[n:])
+
+    # 16f. A blocking read that does not finish in time is an error, not an empty result.
+    real_ack = mod.ACK_TIMEOUT_SECONDS
+    mod.ACK_TIMEOUT_SECONDS = 0.2
+    raised = ""
+    try:
+        plugin._run_blocking(asyncio.sleep(1.0))
+    except TimeoutError as exc:
+        raised = str(exc)
+    finally:
+        mod.ACK_TIMEOUT_SECONDS = real_ack
+    check(bool(raised), "a read past the acknowledgement timeout raises", raised=raised)
+
+    # 16g. Past the follow limit, a later turn that still waits is an update; the next one is the answer.
+    ctx.config["follow_timeout_seconds"] = 2
+    task_id, adm = new_task()
+    gw.end_turn(adm, "waiting\nWAITING: CI")
+    wait_for(lambda: plugin.store.get(task_id)["status"] == "follow_lost", 15)
+    wait_for(lambda: plugin._live_observer(task_id) is None)
+    gw.messages = [{"role": "assistant", "text": "rerun started\nWAITING: CI"}]
+    gw.running = False
+    row = plugin.status(task_id)["tasks"][0]
+    check(row["status"] == "follow_lost" and "answer" not in row and row.get("waiting_on") == ["CI"],
+          "a later turn that still waits is an update, not the answer", row=row)
+    gw.messages = [{"role": "assistant", "text": "CI green, merged"}]
+    row = plugin.status(task_id)["tasks"][0]
+    check(row["status"] == "answered" and row.get("answer") == "CI green, merged",
+          "the next later turn is the answer", row=row)
+    ctx.config.pop("follow_timeout_seconds")
+
+    # 17. An approval with no raise time still ends with a notice.
+    ended = {}
+    for name in ("interrupted", "timeout", "ran"):
+        try:
+            text, record = plugin._ended_text("t-old", {"profile": "implementer", "session_id": "s1"},
+                                              {"prompt_id": "p0", "command": "ls"}, (name, ""))
+            ended[name] = (text, record["settled_after_s"])
+        except Exception as exc:  # noqa: BLE001 - the failure is what the check reports
+            ended[name] = repr(exc)
+    check(all(isinstance(v, tuple) and "`ls`" in v[0] and v[1] is None for v in ended.values())
+          and "expired unanswered (the implementer" in ended["timeout"][0],
+          "an approval with no raise time ends with a notice and no duration", ended=ended)
+
+    # 18. status running right after the end is written: nothing is injected after it hands the answer over.
+    late_total, status_got = 0, 0
+    for i in range(20):
+        task_id, adm = new_task()
+        close_task(task_id)
+        answer = f"the answer {i}"
+        ready, done = threading.Event(), threading.Event()
+        box = {}
+
+        def run_status(tid=task_id, ready=ready, done=done, box=box):
+            ready.wait(5)
+            box["row"] = plugin.status(tid)["tasks"][0]
+            box["seen"] = len(ctx.injected)
+            done.set()
+
+        real_modify = plugin.store.modify
+        fired = {"n": 0}
+
+        def spy(tid, change, _real=real_modify, fired=fired, ready=ready, done=done):
+            out = _real(tid, change)
+            if out is not None and out.get("status") == "answered" and not fired["n"]:
+                fired["n"] = 1
+                ready.set()
+                done.wait(2.0)
+            return out
+
+        plugin.store.modify = spy
+        racer = threading.Thread(target=run_status, daemon=True)
+        racer.start()
+        n = len(ctx.injected)
+        plugin._deliver(task_id, f"Answer from implementer: {answer}", status="answered", last_answer=answer)
+        plugin.store.modify = real_modify
+        racer.join(15)
+        time.sleep(0.3)
+        plugin._flush_outbox("retry")
+        late_total += len([x for x in ctx.injected[box.get("seen", n):] if answer in x])
+        status_got += (box.get("row") or {}).get("answer") == answer
+    check(late_total == 0 and status_got == 20, "over 20 rounds, no answer is injected after status handed it over",
+          late=late_total, status_handed_over=status_got)
+
+    # 18b. A paused task whose connection was cut reads the session's later turns, not the paused receipt.
+    set_subtasks({})
+    task_id, adm = new_task()
+    gw.end_turn(adm, "waiting\nWAITING: CI")
+    wait_for(lambda: plugin.store.get(task_id)["status"] == "waiting_subwork")
+    close_task(task_id)
+    plugin.store.update(task_id, status="waiting_subwork")
+    plugin._wait_cut(task_id, None, "connection reset")
+    check(plugin.store.get(task_id)["status"] == "wait_lost", "the cut paused task is wait_lost",
+          status=plugin.store.get(task_id)["status"])
+    gw.done[adm] = "waiting\nWAITING: CI"
+    gw.messages = [{"role": "assistant", "text": "CI green, finished", "timestamp": time.time() + 1}]
+    gw.running = False
+    row = plugin.status(task_id)["tasks"][0]
+    check(row["status"] == "answered" and row.get("answer") == "CI green, finished",
+          "status of a cut paused task returns the later turn that finished it", row=row)
+
+    # 18c. Past the follow limit, a later turn with the same text as the paused one is still a new turn.
+    ctx.config["follow_timeout_seconds"] = 2
+    set_subtasks({"t-sub9": sub("running")})
+    task_id, adm = new_task()
+    gw.end_turn(adm, "Done")
+    wait_for(lambda: plugin.store.get(task_id)["status"] == "follow_lost", 15)
+    wait_for(lambda: plugin._live_observer(task_id) is None)
+    set_subtasks({})
+    told_at = plugin.store.get(task_id)["told_at"]
+    gw.messages = [{"role": "assistant", "text": "Done", "timestamp": told_at - 1}]
+    row = plugin.status(task_id)["tasks"][0]
+    check(row["status"] == "follow_lost" and "answer" not in row, "the paused turn itself is not a new turn", row=row)
+    plugin.store.update(task_id, told_at=None)
+    gw.messages = [{"role": "assistant", "text": "Done", "timestamp": told_at + 1}]
+    row = plugin.status(task_id)["tasks"][0]
+    check(row["status"] == "follow_lost" and "answer" not in row,
+          "a task stored with no told time compares the text, so the told turn is not told again", row=row)
+    plugin.store.update(task_id, told_at=told_at)
+    gw.messages = [{"role": "assistant", "text": "Done", "timestamp": told_at + 1}]
+    row = plugin.status(task_id)["tasks"][0]
+    check(row["status"] == "answered" and row.get("answer") == "Done",
+          "a later turn with the same text is the answer", row=row)
+    ctx.config.pop("follow_timeout_seconds")
 
     mod._Connection = real_connection
     print(f"{failures} failure(s)")
