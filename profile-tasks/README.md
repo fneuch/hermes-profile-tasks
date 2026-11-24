@@ -24,8 +24,10 @@ profile served by the same Hermes gateway.
   (`interrupted`, or `unknown`, in which case the target session stays paused until a person
   resends or discards the turn in the desktop). Status also lists, per task, the last approval's
   outcome and any notice the manager conversation has not taken yet.
-- Notices to the manager conversation (answers, wait limit, approvals, restarts) are kept in the
-  plugin state until that conversation takes them. All the notices a task has queued go in one
+- Notices to the manager conversation (answers, failures, approvals, MCP re-authentication, cut
+  waits, restarts, follow limit) are kept in the plugin state until that conversation takes them.
+  Progress is not sent there: a paused turn's update and the wait-limit message start no turn in
+  the manager; `status`, the task session and the status-bar item show them. All the notices a task has queued go in one
   injection, in order: Hermes may queue separate injections made at once in any order. Notices of
   different tasks are still separate injections. A refused one is retried, in order, at the start
   of the next `profile_task` call or at the next event of its task; the gateway refuses a
@@ -50,18 +52,20 @@ profile served by the same Hermes gateway.
      (`_session_owns_pending_process_notification`);
   4. the last non-empty line of the turn's text starts with `WAITING:` (the target is told to write
      it when something it started will bring it back; without it the answer is taken as final).
-  Paused: the manager gets `Update from <profile> for task <id> ... Not finished: it is waiting on
-  <reasons>` with the turn's text, the task is `waiting_subwork`, and its next turns arrive on their
-  own (no `follow_up` needed; one is accepted, and sent on the observer's connection). Finished: the
+  Paused: the task is `waiting_subwork`, `status` shows the turn's text (`update`) and its reasons
+  (`waiting_on`), nothing is sent to the manager, and its next turns arrive on their own (no
+  `follow_up` needed; one is accepted, and sent on the observer's connection). Finished: the
   manager gets `Answer from <profile> ... finished:`, the task is `answered` and the observer closes.
-  A failed turn is an update saying so while something is open, else the task fails as before.
+  A failed turn while something is open is sent to the manager as `Update from <profile> for task
+  <id> ... Not finished: it is waiting on <reasons>` with the failure; else the task fails as before.
   Conditions 2 and 3 use Hermes internals that exist only in the gateway process; if they are
   missing, the load reports it and only conditions 1 and 4 apply.
 - Follow limit: `follow_timeout_seconds` (default 86400). A paused task with no new turn that long
   gets a `follow_limit` notice, becomes `follow_lost` and its observer closes; the session still
   exists, and `status` reads it (a turn that arrived later is returned as a late answer).
-- Wait limit: 30 minutes by default, for the turn the plugin submitted. Past it the manager gets a message: no answer yet, the work
-  is not cancelled, check back with `status`.
+- Wait limit: 30 minutes by default, for the turn the plugin submitted. Past it the task is
+  `waiting_timeout` and the work is not cancelled; the manager gets no message (`status` shows it),
+  and the turn's answer is still sent when it ends.
 - Approvals in a task session: the plugin's connection to the target session sees its
   `approval.request` at once and injects a notice into the manager conversation (command, task,
   session, its `@session:<profile>/<session>` reference on a line of its own with the instruction to

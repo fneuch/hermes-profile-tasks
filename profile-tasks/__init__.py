@@ -1069,8 +1069,9 @@ class ProfileTasks:
             final = await conn.wait_terminal(session_id, admission_id, deadline)
         except TimeoutError:
             minutes = round(self._wait_seconds() / 60, 1)
+            # Progress only: the caller is not told; status, the session and the status bar show it.
             self._deliver(task_id, _wait_limit_text(task_id, task, minutes), status="waiting_timeout",
-                          kind="wait_limit", turn=turn)
+                          kind="wait_limit", turn=turn, tell=False)
             # The observer keeps following the session; its turn end still reaches the manager.
             observer.deadline = time.monotonic() + self._follow_seconds()
             self._end_calls(task_id, turn)
@@ -1188,7 +1189,8 @@ class ProfileTasks:
                 lead = f"Update from {profile} for {_label(task_id, task)}. Not finished: it is waiting on {what}."
             body = f"this turn failed: {failure}" if failure else text
             observer.deadline = time.monotonic() + self._follow_seconds()
-            self._deliver(task_id, f"{lead}\n\n{body}", status="waiting_subwork", kind="update",
+            # Progress only, unless the turn failed: status, the session and the status bar show it.
+            self._deliver(task_id, f"{lead}\n\n{body}", status="waiting_subwork", kind="update", tell=bool(failure),
                           last_update=text, pause_reasons=reasons, paused_at=time.time(), last_answer=None,
                           error=failure or None)
             return
@@ -1684,8 +1686,11 @@ class ProfileTasks:
         return box.get("value", {"ok": False, "error": "timed out"})
 
     # notices to the calling conversation: kept in the task until that conversation takes them
-    def _notify(self, task_id: str, message: str, kind: str, trigger: str = "event") -> bool:
-        """Queue *message* for the task's calling conversation and try to hand over the queue in order."""
+    def _notify(self, task_id: str, message: str, kind: str, trigger: str = "event", *, tell: bool = True) -> bool:
+        """Queue *message* for the task's calling conversation and try to hand over the queue in order.
+
+        With *tell* False the calling conversation gets nothing (progress only: status and the session show it).
+        """
         if (self.store.get(task_id) or {}).get("key"):
             # A keyed task has no calling conversation: the notice is only recorded, never injected.
             entry = _notice(message, kind)
@@ -1693,6 +1698,10 @@ class ProfileTasks:
                 self.store.modify(task_id, lambda task: {
                     "notices": _keyed_notices(task.get("notices") or [], [entry], trigger)})
             return True
+        if not tell:
+            logger.info("profile-tasks: task %s: %s notice not sent to the calling conversation", task_id, kind)
+            # The event still retries notices queued earlier and refused.
+            return self._flush_task(task_id, trigger)
         self._queue_only(task_id, message, kind)
         return self._flush_task(task_id, trigger)
 
@@ -1770,8 +1779,11 @@ class ProfileTasks:
             self.store.modify(task_id, lambda t: {"outbox": [e for e in t.get("outbox") or [] if e["kind"] != kind]})
 
     def _deliver(self, task_id: str, message: str, *, status: str, kind: str = "result", turn: str | None = None,
-                 **fields: Any) -> None:
-        """Record *status* and *fields* and send *message*; with *turn*, only while that turn still owns the task."""
+                 tell: bool = True, **fields: Any) -> None:
+        """Record *status* and *fields* and send *message*; with *turn*, only while that turn still owns the task.
+
+        *tell* False records without sending *message* to the calling conversation (see _notify).
+        """
         new = {"status": status, **({"delivered": False} if kind == "result" else {}), **fields}
         final = status in ("answered", "failed")
         if final:
@@ -1803,7 +1815,7 @@ class ProfileTasks:
             logger.info("profile-tasks: task %s: a newer turn owns the task; its earlier %s is sent as a notice only",
                         task_id, kind)
             kind = f"earlier_{kind}"
-        self._notify(task_id, message, kind)
+        self._notify(task_id, message, kind, tell=tell)
 
     def _drop_dead_approval(self, task_id: str, cause: str) -> str:
         """Clear an approval nobody can watch any more; return a sentence for the notice, or ''."""
@@ -2189,8 +2201,9 @@ SCHEMA = {
         "tokens. action=start returns at once with a task id and the session; the final answer arrives later "
         "in this conversation as a new message, so end your turn after starting. action=follow_up sends a "
         "new message in the same task session once its turn has ended (refused while it runs). A task is followed "
-        "to its real end: updates arrive here by themselves while it waits on its own work, and the last message "
-        "says finished. action=correct "
+        "to its real end: while it waits on its own work or runs past the wait limit nothing arrives here "
+        "(action=status shows its progress), and the last message says finished. Failures, approvals and "
+        "restarts still arrive here. action=correct "
         "steers the turn that is running now. "
         "action=status lists tasks and their state; for a task nobody waits on any more (past the wait limit, "
         "or a gateway restart) it reads the target turn and returns the late answer or what happened. "

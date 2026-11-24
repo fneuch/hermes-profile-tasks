@@ -3,6 +3,7 @@
 - a turn started by an injection in a followed session reaches the manager, with its place in ``turns``;
 - an open sub-task of the target profile, started from that session, makes the turn end an update; one from
   another session does not count; a delivered answer no longer counts;
+- an update is not sent to the manager (status shows it), unless its turn failed;
 - ``WAITING:`` counts on the last line only; a queued prompt and a background command count; with that internal
   missing the load says so and the other two conditions still apply;
 - a failed turn is an update while something is open, else the task failed;
@@ -210,6 +211,16 @@ def main() -> int:
     def last_text() -> str:
         return ctx.injected[-1] if ctx.injected else ""
 
+    def paused_quietly(task_id: str, n: int, reasons: list, text: str) -> bool:
+        """The task paused with *reasons*, status shows the update, and nothing new reached the manager."""
+        if not wait_for(lambda: plugin.store.get(task_id).get("last_update") == text):
+            return False
+        time.sleep(0.5)
+        row = plugin.status(task_id)["tasks"][0]
+        return (len(ctx.injected) == n and not plugin.store.get(task_id).get("outbox")
+                and row["status"] == "waiting_subwork" and row.get("update") == text
+                and row.get("waiting_on") == reasons)
+
     def close_task(task_id: str) -> None:
         # Ends the observer of a task a scenario leaves open.
         observer = plugin._live_observer(task_id)
@@ -219,10 +230,11 @@ def main() -> int:
 
     # 1. A turn started by an injection reaches the manager, with its place in turns.
     task_id, adm = new_task()
+    n = len(ctx.injected)
     gw.end_turn(adm, "first step done\nWAITING: CI")
-    wait_for(lambda: len(ctx.injected) >= 1)
-    check("Update from implementer for task " in last_text() and "waiting on CI" in last_text(),
-          "the submitted turn ends as an update when it declares WAITING:", injected=ctx.injected)
+    check(paused_quietly(task_id, n, ["CI"], "first step done\nWAITING: CI"),
+          "the submitted turn that declares WAITING: is an update status shows, not sent to the manager",
+          injected=ctx.injected[n:], row=plugin.status(task_id)["tasks"][0])
     check(plugin.store.get(task_id)["status"] == "waiting_subwork", "the task is waiting_subwork",
           status=plugin.store.get(task_id)["status"])
     n = len(ctx.injected)
@@ -254,18 +266,16 @@ def main() -> int:
     task_id, adm = new_task()
     n = len(ctx.injected)
     gw.end_turn(adm, "review requested")
-    wait_for(lambda: len(ctx.injected) > n)
-    check("waiting on task t-sub1 (reviewer)" in last_text() and "end your turn without a follow_up" in last_text()
-          and plugin.store.get(task_id)["status"] == "waiting_subwork",
-          "an open sub-task makes the turn end an update naming it", injected=ctx.injected[n:])
+    check(paused_quietly(task_id, n, ["task t-sub1 (reviewer)"], "review requested"),
+          "an open sub-task makes the turn end an update naming it, not sent to the manager",
+          injected=ctx.injected[n:])
 
     # 3. An answered sub-task whose answer is not delivered still counts; delivered, the turn is final.
     n = len(ctx.injected)
     set_subtasks({"t-sub1": sub("answered", delivered=False)})
     gw.start_injected("inj-2")
     gw.end_turn("inj-2", "verdict read, fixing")
-    wait_for(lambda: len(ctx.injected) > n)
-    check("Update from implementer" in last_text() and "t-sub1" in last_text(),
+    check(paused_quietly(task_id, n, ["task t-sub1 (reviewer)"], "verdict read, fixing"),
           "an answered sub-task with an undelivered answer is still an update", injected=ctx.injected[n:])
     n = len(ctx.injected)
     set_subtasks({"t-sub1": sub("answered", delivered=True)})
@@ -299,8 +309,7 @@ def main() -> int:
     task_id, adm = new_task()
     n = len(ctx.injected)
     gw.end_turn(adm, "done for now")
-    wait_for(lambda: len(ctx.injected) > n)
-    check("waiting on a queued turn" in last_text(), "a queued prompt makes the turn end an update",
+    check(paused_quietly(task_id, n, ["a queued turn"], "done for now"), "a queued prompt makes the turn end an update",
           injected=ctx.injected[n:])
     close_task(task_id)
     live_sessions()
@@ -310,9 +319,8 @@ def main() -> int:
     task_id, adm = new_task()
     n = len(ctx.injected)
     gw.end_turn(adm, "started the build")
-    wait_for(lambda: len(ctx.injected) > n)
-    check("waiting on a background command" in last_text(), "a background command makes the turn end an update",
-          injected=ctx.injected[n:])
+    check(paused_quietly(task_id, n, ["a background command"], "started the build"),
+          "a background command makes the turn end an update", injected=ctx.injected[n:])
     close_task(task_id)
     # With the internal missing: reported at load, only conditions 1 and 4 apply.
     plugin.soft_missing = ["tui_gateway.session_notifications._session_owns_pending_process_notification"]
@@ -345,8 +353,10 @@ def main() -> int:
     n = len(ctx.injected)
     gw.end_turn(adm, "", status="error", error="model crashed")
     wait_for(lambda: len(ctx.injected) > n)
-    check("this turn failed: model crashed" in last_text() and plugin.store.get(task_id)["status"] == "waiting_subwork",
-          "a failed turn with an open sub-task is an update and the task stays open", injected=ctx.injected[n:])
+    check("this turn failed: model crashed" in last_text() and "Not finished: it is waiting on task t-sub2" in last_text()
+          and len(ctx.injected) == n + 1 and plugin.store.get(task_id)["status"] == "waiting_subwork",
+          "a failed turn with an open sub-task is an update sent to the manager and the task stays open",
+          injected=ctx.injected[n:])
     close_task(task_id)
     set_subtasks({})
     task_id, adm = new_task()
@@ -487,7 +497,7 @@ def main() -> int:
     # 13. A refused notice is tried again by the 60 s retry, with no tool call.
     task_id, adm = new_task()
     ctx.accept = False
-    gw.end_turn(adm, "waiting\nWAITING: CI")
+    gw.end_turn(adm, "all done")
     wait_for(lambda: plugin.store.get(task_id).get("outbox"))
     n = len(ctx.injected)
     plugin.retry_seconds = 0.3
@@ -569,8 +579,9 @@ def main() -> int:
     n = len(ctx.injected)
     gw.emit("message.complete", text="half done\nWAITING: CI", status="complete", admission_id=adm)
     wait_for(lambda: plugin.store.get(task_id)["status"] == "waiting_subwork")
-    check(plugin._live_observer(task_id) is not None and "Update from implementer" in last_text(),
-          "the observer keeps following the paused task", injected=ctx.injected[n:])
+    time.sleep(0.5)
+    check(plugin._live_observer(task_id) is not None and len(ctx.injected) == n,
+          "the observer keeps following the paused task, and the update is not sent", injected=ctx.injected[n:])
     ctx.config.pop("wait_timeout_seconds")
 
     # 16b. The observer is busy until a turn's end is handled.

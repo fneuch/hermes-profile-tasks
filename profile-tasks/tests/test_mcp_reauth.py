@@ -273,9 +273,10 @@ def main() -> int:
     finally:
         mod._Connection = real_conn
     texts = [t for t, _ in ctx.injected[before:]]
-    check(seen[0].infos == 1 and seen[0].waits == 1 and any("no answer within" in t for t in texts),
-          "on the wait-limit path the MCP states are read at the start and the observer keeps following",
-          infos=seen[0].infos, waits=seen[0].waits, injected=texts)
+    check(seen[0].infos == 1 and seen[0].waits == 1 and not any("no answer within" in t for t in texts)
+          and plugin.store.get("t-w")["status"] == "waiting_timeout",
+          "on the wait-limit path the MCP states are read at the start, the observer keeps following and the "
+          "manager gets no wait-limit notice", infos=seen[0].infos, waits=seen[0].waits, injected=texts)
     # The turn's end, seen by the observer past the wait limit, reads the MCP states again.
     observer = types.SimpleNamespace(ended=set(), conn=seen[0], deadline=None, stop=lambda: None)
     asyncio.run(plugin._turn_ended("t-w", {"session_id": "s-w", "payload": {

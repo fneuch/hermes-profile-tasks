@@ -894,9 +894,13 @@ async def trial_timeout_status(ctx) -> None:
         ack = await start_task(ctx, mgr, sid, "SLOW", "slow task")
         task_id = ack["task_id"]
         t0 = time.monotonic()
-        wake = await until(lambda: manager_got(ctx["m"], f"Task {task_id}"), WAIT_LIMIT + 60, "timeout message")
-        check("limit", "not cancelled" in wake, "past the wait limit the manager is told to check back",
-              seconds=round(time.monotonic() - t0, 1), wake_message=wake)
+        await until(lambda: plugin_task(task_id).get("status") == "waiting_timeout", WAIT_LIMIT + 60, "wait limit")
+        seconds = round(time.monotonic() - t0, 1)
+        await asyncio.sleep(5)
+        wake = manager_saw(ctx["m"], "no answer within")
+        check("limit", wake is None and not plugin_task(task_id).get("outbox"),
+              "past the wait limit the task is waiting_timeout and the manager gets no message",
+              seconds=seconds, wake_message=wake)
         early = await ask_status(ctx, mgr, sid, task_id)
         row = early["tasks"][0]
         check("status", row["status"] == "waiting_timeout" and row.get("turn") in ("queued", "started")
@@ -1203,20 +1207,20 @@ def first_request_with(server: FakeLLMServer, needle: str) -> int | None:
 
 
 async def trial_follow(ctx) -> None:
-    """A task is followed to its real end: two updates while it waits on its own work, then one final answer."""
+    """A task is followed to its real end: two pauses on its own work, sent nowhere, then one final answer."""
     async with Client("default") as mgr:
         sid = await manager_session(mgr)
         ack = await start_task(ctx, mgr, sid, "FLOW", "follow to the end", profile="implementer")
         task_id, asid = ack["task_id"], ack["session_id"]
-        first = await until(lambda: manager_saw(ctx["m"], f"Update from implementer for task {task_id}"), 120,
-                            "first update")
+        first = await until(lambda: (lambda t: t if t.get("status") == "waiting_subwork" else None)(
+            plugin_task(task_id)), 120, "first pause")
         first_at = time.time()
         sub = next(((k, v) for k, v in profile_tasks_of("implementer").items() if v.get("profile") == "reviewer"),
                    (None, {}))
-        check("follow", sub[0] is not None and f"waiting on task {sub[0]} (reviewer)" in first
-              and plugin_task(task_id).get("status") == "waiting_subwork",
-              "the implementer started task B on the reviewer and ended its turn: the manager got an update naming "
-              "task B and the task is waiting_subwork", update=first[:400], subtask=sub[0])
+        check("follow", sub[0] is not None and first.get("pause_reasons") == [f"task {sub[0]} (reviewer)"]
+              and not manager_saw(ctx["m"], "Update from implementer"),
+              "the implementer started task B on the reviewer and ended its turn: the task is waiting_subwork on "
+              "task B and the manager got no update", pause_reasons=first.get("pause_reasons"), subtask=sub[0])
         turns_before = len(ctx["a"].main_requests())
         await asyncio.sleep(max(0, first_at + 60 - time.time()))
         quiet = plugin_task(task_id)
@@ -1226,22 +1230,26 @@ async def trial_follow(ctx) -> None:
         check("follow", len(ctx["a"].main_requests()) == turns_before and quiet.get("status") == "waiting_subwork"
               and not manager_saw(ctx["m"], f"Answer from implementer for task {task_id}")
               and len(ctx["r"].main_requests()) >= 1,
-              "60 s after the update the implementer session is still open and has no turn, the reviewer is still "
+              "60 s after the pause the implementer session is still open and has no turn, the reviewer is still "
               "working, and the manager got nothing more", implementer_requests=len(ctx["a"].main_requests()) - turns_before,
               status=quiet.get("status"))
-        second = await until(lambda: manager_saw(ctx["m"], "waiting on CI"), 120, "second update")
-        check("follow", f"Update from implementer for task {task_id}" in second and "task " + str(sub[0]) not in
-              second.split("Not finished:", 1)[-1].split("\n", 1)[0] and "Verdict received" in second,
-              "the reviewer verdict started a turn in the implementer session; it ended with WAITING: CI and the "
-              "manager got a second update", update=second[:400])
+        second = await until(lambda: (lambda t: t if t.get("pause_reasons") == ["CI"] else None)(
+            plugin_task(task_id)), 120, "second pause")
+        status = await call_tool(ctx, mgr, sid, {"action": "status", "task_id": task_id}, "status")
+        row = (status.get("tasks") or [{}])[0]
+        check("follow", "Verdict received" in (second.get("last_update") or "")
+              and row.get("waiting_on") == ["CI"] and "Verdict received" in (row.get("update") or "")
+              and not manager_saw(ctx["m"], "Update from implementer"),
+              "the reviewer verdict started a turn in the implementer session; it ended with WAITING: CI, status "
+              "shows that update and the manager got none", status=row)
         taken = await call_tool(ctx, mgr, sid, {"action": "follow_up", "task_id": task_id,
                                                 "text": "SCENARIO:FLOW CI-GREEN"}, "follow_up")
         final = await until(lambda: manager_saw(ctx["m"], f"Answer from implementer for task {task_id}"), 120,
                             "final answer")
         done = await until(lambda: (lambda t: t if t.get("status") == "answered" else None)(plugin_task(task_id)),
                            30, "task answered")
-        order = [first_request_with(ctx["m"], n) for n in (
-            f"Update from implementer for task {task_id}", "waiting on CI", f"Answer from implementer for task {task_id}")]
+        answers = [b for b in ctx["m"].main_requests() if b["messages"][-1].get("role") == "user"
+                   and f"Answer from implementer for task {task_id}" in text_of(b["messages"][-1])]
         outboxes = {p: [t_id for t_id, t in profile_tasks_of(p).items() if t.get("outbox")]
                     for p in ("default", "implementer", "reviewer")}
         rows = analyst_db_of("implementer", "SELECT role, coalesce(content, '') FROM messages")
@@ -1254,11 +1262,11 @@ async def trial_follow(ctx) -> None:
               "once task B is answered its reviewer session is closed by the orphan grace, and no notice to the "
               "implementer session was refused as 'not a live local session'", reviewer_end=reviewer_end, refused=refused[:3])
         check("follow", taken.get("accepted") is True and "FLOW-FINAL" in final and "finished:" in final
-              and all(x is not None for x in order) and order == sorted(order) and len(set(order)) == 3
+              and len(answers) == 1 and not manager_saw(ctx["m"], "Update from implementer")
               and not any(outboxes.values()) and done.get("turns") and len(done["turns"]) == 3
               and any("Answer from reviewer" in r[1] for r in rows if r[0] == "user"),
-              "the manager got two updates then one final answer, in order; the task is answered after three turns in "
-              "one session; no notice is left in any outbox", order=order, outboxes=outboxes, turns=done.get("turns"),
+              "the manager got no update and one final answer; the task is answered after three turns in one "
+              "session; no notice is left in any outbox", answers=len(answers), outboxes=outboxes, turns=done.get("turns"),
               final=final[:300], session=asid)
 
 
