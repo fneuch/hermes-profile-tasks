@@ -1743,7 +1743,29 @@ class ProfileTasks:
 
             return not self.store.modify(task_id, merge)["outbox"]
 
+    def _answer_taken_by_status(self, task_id: str, turn: str | None) -> bool:
+        """Drop the queued result and mark an ended task delivered by status, in one write; True when marked.
+
+        *turn* is the turn status read; a newer turn's result was not handed over, so it is left as it is.
+        """
+        marked = {}
+
+        def change(task: dict) -> dict | None:
+            if turn is not None and task.get("turn_token") != turn:
+                return None
+            fields = {"outbox": [e for e in task.get("outbox") or [] if e["kind"] != "result"]}
+            if task.get("status") in ("answered", "failed") and not task.get("delivered"):
+                # An injection already recorded keeps its delivered_by; a keyed task is handed over by result().
+                fields.update(delivered=True, delivered_by="result" if task.get("key") else "status")
+                marked["ok"] = True
+            return fields
+
+        with self._outbox_lock:
+            self.store.modify(task_id, change)
+        return bool(marked)
+
     def _drop_notices(self, task_id: str, kind: str) -> None:
+        """Remove queued notices of *kind*; status uses _answer_taken_by_status for the result instead."""
         with self._outbox_lock:
             self.store.modify(task_id, lambda t: {"outbox": [e for e in t.get("outbox") or [] if e["kind"] != kind]})
 
@@ -1958,6 +1980,8 @@ class ProfileTasks:
             # Keyed tasks belong to their plugin caller, not to the tool's task list.
             tasks = {tid: t for tid, t in tasks.items() if not t.get("key")}
         extra: dict[str, dict] = {}
+        # The turn each refreshed read is about; a follow_up may end a newer turn before the task is read again.
+        refreshed_turn: dict[str, str | None] = {}
         for tid, task in tasks.items():
             if not _waiter_alive(task.get("waiter")) and (task.get("pending_approval")
                                                            or task.get("settling_approval")):
@@ -1966,6 +1990,7 @@ class ProfileTasks:
             followed = task.get("status") in (*WAITING, "waiting_subwork") and _waiter_alive(task.get("waiter"))
             if task.get("status") in REFRESHABLE and not followed:
                 extra[tid] = self._refresh(task)
+                refreshed_turn[tid] = task.get("turn_token")
                 tasks[tid] = self.store.get(tid) or task
         keep = ("task_id", "profile", "status", "session_id", "title", "delivered", "error", "created_at", "updated_at")
         rows = []
@@ -1986,7 +2011,9 @@ class ProfileTasks:
                 row["answer"] = t["last_answer"]
             if "answer" in row or "answer" in extra.get(tid, {}):
                 # This result hands the answer over; the queued injection of it would repeat it.
-                self._drop_notices(tid, "result")
+                turn = refreshed_turn[tid] if "answer" in extra.get(tid, {}) else t.get("turn_token")
+                if self._answer_taken_by_status(tid, turn):
+                    row["delivered"] = True
                 left = [e["text"] for e in t.get("outbox") or [] if e["kind"] != "result"]
                 if left:
                     row["notices_not_delivered"] = left

@@ -708,6 +708,65 @@ def main() -> int:
     check(late_total == 0 and status_got == 20, "over 20 rounds, no answer is injected after status handed it over",
           late=late_total, status_handed_over=status_got)
 
+    # 18d. status taking a queued answer marks it delivered, so a parent no longer counts the task as open.
+    task_id, adm = new_task()
+    close_task(task_id)
+    ctx.accept = False
+    plugin._deliver(task_id, "Answer from implementer: queued", status="answered", last_answer="queued")
+    ctx.accept = True
+    row = plugin.status(task_id)["tasks"][0]
+    task = plugin.store.get(task_id)
+    check(row.get("answer") == "queued" and row.get("delivered") is True and task.get("delivered") is True
+          and task.get("delivered_by") == "status" and not task.get("outbox"),
+          "status taking a queued answer records it delivered by status", row=row, task=task)
+    task_id, adm = new_task()
+    close_task(task_id)
+    plugin._deliver(task_id, "Answer from implementer: injected", status="answered", last_answer="injected")
+    wait_for(lambda: plugin.store.get(task_id).get("delivered") is True)
+    plugin.status(task_id)
+    check(plugin.store.get(task_id).get("delivered_by") == "injection",
+          "an answer already injected keeps its injection record", task=plugin.store.get(task_id))
+    # A newer turn ending after status read the task keeps its queued result and stays undelivered.
+    task_id, adm = new_task()
+    close_task(task_id)
+    ctx.accept = False
+    plugin._deliver(task_id, "Answer from implementer: older", status="answered", last_answer="older")
+    ctx.accept = True
+    snapshot = plugin.store.all()
+    newer = mod._notice("Answer from implementer: newer", "result")
+    plugin.store.modify(task_id, lambda t: {"turn_token": "newer-turn", "last_answer": "newer", "delivered": False,
+                                            "delivered_by": None, "outbox": [newer]})
+    real_all = plugin.store.all
+    plugin.store.all = lambda: snapshot
+    try:
+        row = plugin.status(task_id)["tasks"][0]
+    finally:
+        plugin.store.all = real_all
+    task = plugin.store.get(task_id)
+    check(row.get("answer") == "older" and not task.get("delivered") and task.get("delivered_by") is None
+          and [e["id"] for e in task.get("outbox") or []] == [newer["id"]],
+          "status reading an earlier turn leaves a newer turn's queued result undelivered", row=row, task=task)
+    # A newer turn ending between a refreshed read and the task's reload keeps its queued result.
+    task_id, adm = new_task()
+    close_task(task_id)
+    plugin.store.modify(task_id, lambda t: {"status": "wait_lost"})
+    newer = mod._notice("Answer from implementer: newer", "result")
+
+    def refresh_then_newer_turn(task, tid=task_id, newer=newer):
+        plugin.store.modify(tid, lambda t: {"turn_token": "newer-turn", "status": "answered", "last_answer": "newer",
+                                            "delivered": False, "delivered_by": None, "outbox": [newer]})
+        return {"answer": "older"}
+
+    plugin._refresh = refresh_then_newer_turn
+    try:
+        row = plugin.status(task_id)["tasks"][0]
+    finally:
+        del plugin._refresh
+    task = plugin.store.get(task_id)
+    check(row.get("answer") == "older" and not task.get("delivered") and task.get("delivered_by") is None
+          and [e["id"] for e in task.get("outbox") or []] == [newer["id"]],
+          "a newer turn ending after a refreshed read keeps its queued result undelivered", row=row, task=task)
+
     # 18b. A paused task whose connection was cut reads the session's later turns, not the paused receipt.
     set_subtasks({})
     task_id, adm = new_task()

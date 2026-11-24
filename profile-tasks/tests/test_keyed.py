@@ -100,7 +100,8 @@ def main() -> int:
     notices = plugin.store.get(first["task_id"]).get("notices") or []
     check(len(notices) == 1 and notices[0]["delivered_at"] is None and not plugin.store.get(first["task_id"]).get(
           "outbox") and "text" not in notices[0] and "notices" not in got
-          and plugin.store.get(first["task_id"]).get("delivered") is True,
+          and plugin.store.get(first["task_id"]).get("delivered") is True
+          and plugin.store.get(first["task_id"]).get("delivered_by") == "result",
           "the answer notice is recorded on the task without its text, never queued for injection; result marks "
           "the answer delivered", notices=notices, result=got)
 
