@@ -41,7 +41,7 @@ def read_tasks(path: Path) -> dict[str, dict]:
 
 
 def task_state(task: dict) -> str:
-    """``approval``, ``running``, ``past_wait_limit``, ``wait_lost``, ``answered``, ``late_answer`` or ``failed``.
+    """``approval``, ``running``, ``past_wait_limit``, ``waiting_on_own_work``, ``past_follow_limit``, ``wait_lost``, ``answered``, ``late_answer`` or ``failed``.
 
     A late answer is one read after the wait ended (wait limit or gateway restart): the tool's action=status
     records it with ``delivered_by: status``.
@@ -53,6 +53,10 @@ def task_state(task: dict) -> str:
         return "running"
     if status == "waiting_timeout":
         return "past_wait_limit"
+    if status == "waiting_subwork":
+        return "waiting_on_own_work"
+    if status == "follow_lost":
+        return "past_follow_limit"
     if status == "answered":
         return "late_answer" if task.get("delivered_by") == "status" else "answered"
     return status or "unknown"

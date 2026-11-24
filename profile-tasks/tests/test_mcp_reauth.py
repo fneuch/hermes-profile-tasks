@@ -18,6 +18,7 @@ import logging
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
@@ -235,7 +236,7 @@ def main() -> int:
         with core._lock:
             core._servers.pop((home, "asana"), None)
 
-    # Past the wait limit, the MCP states are read again once the approval watch ends.
+    # Past the wait limit, the observer keeps following the session.
     class WaitConn:
         def __init__(self, home_, on_frame=None):
             self.infos, self.waits = 0, 0
@@ -272,10 +273,18 @@ def main() -> int:
     finally:
         mod._Connection = real_conn
     texts = [t for t, _ in ctx.injected[before:]]
-    check(seen[0].infos == 2 and seen[0].waits == 2 and any("no answer within" in t for t in texts)
-          and any("hermes -p reviewer mcp login linear" in t for t in texts),
-          "on the wait-limit path the MCP states are read at the start and again after the approval watch",
+    check(seen[0].infos == 1 and seen[0].waits == 1 and any("no answer within" in t for t in texts),
+          "on the wait-limit path the MCP states are read at the start and the observer keeps following",
           infos=seen[0].infos, waits=seen[0].waits, injected=texts)
+    # The turn's end, seen by the observer past the wait limit, reads the MCP states again.
+    observer = types.SimpleNamespace(ended=set(), conn=seen[0], deadline=None, stop=lambda: None)
+    asyncio.run(plugin._turn_ended("t-w", {"session_id": "s-w", "payload": {
+        "admission_id": plugin.store.get("t-w").get("admission_id"), "status": "complete", "text": "done"}},
+        observer))
+    texts = [t for t, _ in ctx.injected[before:]]
+    check(seen[0].infos == 2 and any("hermes -p reviewer mcp login linear" in t for t in texts),
+          "on the wait-limit path the MCP states are read again at the turn's end", infos=seen[0].infos,
+          injected=texts)
 
     print("failures:", failures)
     return 1 if failures else 0

@@ -39,6 +39,10 @@ DEFAULT_WAIT_SECONDS = 1800
 ACK_TIMEOUT_SECONDS = 120
 # After the wait limit the waiter keeps watching the target turn this long, only to relay approvals.
 APPROVAL_WATCH_SECONDS = 24 * 3600
+# A paused task with no new turn for this long is no longer followed (setting follow_timeout_seconds).
+DEFAULT_FOLLOW_SECONDS = APPROVAL_WATCH_SECONDS
+# While a notice is queued and refused, it is tried again this often.
+OUTBOX_RETRY_SECONDS = 60
 RELAY_RULE = "profile_task_relay"
 # A process that loads the plugin but never hosts the gateway (CLI, plugin listing) stops waiting after this.
 LOAD_FLUSH_WAIT_SECONDS = 300
@@ -60,13 +64,25 @@ _STATE_LOCK = threading.Lock()
 # An approval withdrawn this close before the wait was cut ended with the gateway stop.
 STOP_GRACE_SECONDS = 5.0
 WAITING = ("starting", "running")
-REFRESHABLE = ("starting", "running", "waiting_timeout", "wait_lost")
+REFRESHABLE = ("starting", "running", "waiting_timeout", "wait_lost", "waiting_subwork", "follow_lost")
+# A task of the target profile that has not finished: its caller is still waiting for it.
+OPEN_SUBTASK_STATES = ("starting", "running", "waiting_timeout", "waiting_subwork")
+# Frames that show the target session is working on a turn.
+TURN_ACTIVITY = ("message.start", "message.delta", "message.interim", "reasoning.delta", "thinking.delta",
+                 "tool.start", "tool.complete", "tool.generating", "tool.progress", "approval.request")
+# Internals only the pause rule's queued-turn and background-command conditions need; without them the rest works.
+LIVE_SESSION_INTERNALS = ("tui_gateway.session_notifications", "tui_gateway.server.")
+# The gateway stop flag; without it a turn cut by a stop is reported failed instead of left to the restart report.
+STOP_INTERNALS = ("gateway.run_api",)
 # Notices kept on a keyed task (newest last); its follow-up clears them.
 KEYED_NOTICE_LIMIT = 20
 
 TARGET_GUIDANCE = (
     "Nobody watches this session live and nobody can answer a clarify question here. "
-    "If you need information, ask for it in your final answer."
+    "If you need information, ask for it in your final answer. "
+    "If you end a turn while something you started will bring you back to this session (a task given to "
+    "another profile, a background command, a card, a CI run), end your message with a last line "
+    "`WAITING: <what>`. Without it, your answer is taken as final."
 )
 
 
@@ -110,6 +126,13 @@ def check_internals(ctx: Any = None) -> list[str]:
     if plugins is not None and not hasattr(getattr(plugins, "PluginManager", None), "has_gateway_message_injector"):
         missing.append("hermes_cli.plugins.PluginManager.has_gateway_message_injector")
     need("websockets.asyncio.client", ("connect",))
+    need("tui_gateway.session_notifications", ("_session_owns_pending_process_notification",))
+    need("gateway.run_api", ("_ACTIVE_RUNNER",))
+    # The gateway server is heavy to import: it is read only where this process already runs it.
+    served = sys.modules.get("tui_gateway.server")
+    for name in ("_sessions", "_sessions_lock"):
+        if served is not None and not hasattr(served, name):
+            missing.append(f"tui_gateway.server.{name}")
     if client is not None and hasattr(client, "_session_ticket"):
         params = list(inspect.signature(client._session_ticket).parameters)
         if params[:2] != ["home", "endpoint"]:
@@ -261,6 +284,9 @@ class _Connection:
         self.on_frame = on_frame
         self._stack = None
         self.client = None
+        # True while an observer reads the events: wait_terminal then waits for the turn it hands over.
+        self.pumping = False
+        self._completions: dict[str, asyncio.Event] = {}
 
     async def __aenter__(self):
         from contextlib import AsyncExitStack
@@ -298,7 +324,10 @@ class _Connection:
             receipt = await self.rpc("prompt.receipt", session_id=session_id, admission_id=admission_id,
                                      include_result=True)
             if receipt["status"] in ("terminal", "unknown"):
-                self._drain()
+                if self.pumping:
+                    await self._settled(admission_id)
+                else:
+                    self._drain()
                 return receipt
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -308,6 +337,18 @@ class _Connection:
                     await self._completion(admission_id)
             except TimeoutError:
                 backoff = min(backoff * 2, 5.0)
+
+    async def _settled(self, admission_id: str) -> None:
+        """With an observer reading the events: give it a moment to hand over the turn's end frame."""
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(1.0):
+                await self._completions.setdefault(admission_id, asyncio.Event()).wait()
+
+    def completed(self, frame: dict) -> None:
+        """Called by the observer once the end of a turn is handled: wakes the wait for that admission."""
+        admission_id = (frame.get("payload") or {}).get("admission_id")
+        if admission_id:
+            self._completions.setdefault(admission_id, asyncio.Event()).set()
 
     def _drain(self) -> None:
         """Hand over the frames already queued: the gateway sent them before the terminal receipt."""
@@ -331,6 +372,9 @@ class _Connection:
         return frame
 
     async def _completion(self, admission_id: str) -> None:
+        if self.pumping:
+            await self._completions.setdefault(admission_id, asyncio.Event()).wait()
+            return
         while True:
             event = await self.client.events.get()
             if isinstance(event, Exception):
@@ -338,6 +382,107 @@ class _Connection:
             frame = self._dispatch(event)
             if frame.get("type") == "message.complete" and (frame.get("payload") or {}).get("admission_id") == admission_id:
                 return
+
+
+class _Observer:
+    """The one connection that follows a task's target session: bound to it, reading every event it sends.
+
+    It lives in the asyncio loop of the thread that entered it. Other threads put their calls on that loop with
+    ``submit``/``call``, so nothing else resumes (and takes over) the session.
+    """
+
+    def __init__(self, plugin: "ProfileTasks", task_id: str, home: Path) -> None:
+        self.plugin, self.task_id, self.home = plugin, task_id, home
+        self.conn: _Connection | None = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.busy = False
+        self.turn_admission: str | None = None
+        self.ended: set[str] = set()
+        # Monotonic time after which a paused task with no new turn is given up; None while nothing is paused.
+        self.deadline: float | None = None
+        self.error: BaseException | None = None
+        self.closed = False
+        self._stop: asyncio.Event | None = None
+        self._pump_task: asyncio.Task | None = None
+        self._cm: _Connection | None = None
+
+    async def __aenter__(self) -> "_Observer":
+        self.loop = asyncio.get_running_loop()
+        self._stop = asyncio.Event()
+        task_id = self.task_id
+        self._cm = _Connection(self.home, on_frame=lambda frame: self.plugin._on_target_frame(task_id, frame))
+        self.conn = await self._cm.__aenter__()
+        if hasattr(getattr(self.conn, "client", None), "events"):
+            self.conn.pumping = True
+            self._pump_task = asyncio.create_task(self._pump())
+            self._pump_task.add_done_callback(self._pump_done)
+        with self.plugin._observers_lock:
+            self.plugin._observers[task_id] = self
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self.closed = True
+        with self.plugin._observers_lock:
+            if self.plugin._observers.get(self.task_id) is self:
+                del self.plugin._observers[self.task_id]
+        if self._pump_task is not None:
+            self._pump_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._pump_task
+        await self._cm.__aexit__(*exc)
+
+    def _pump_done(self, task: asyncio.Task) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            self.error = task.exception()
+            self._stop.set()
+
+    async def _pump(self) -> None:
+        events = self.conn.client.events
+        while True:
+            event = await events.get()
+            if isinstance(event, Exception):
+                raise event
+            frame = self.conn._dispatch(event)
+            kind = frame.get("type")
+            payload = frame.get("payload") or {}
+            if kind == "message.complete":
+                self.busy = False
+                try:
+                    await self.plugin._turn_ended(self.task_id, frame, self)
+                except Exception:  # noqa: BLE001 - one turn's handling must not end the observation
+                    logger.warning("profile-tasks: end of a turn of task %s not handled", self.task_id, exc_info=True)
+                self.conn.completed(frame)
+            elif kind in TURN_ACTIVITY:
+                self.busy = True
+                if kind.startswith("message.") and payload.get("admission_id"):
+                    self.turn_admission = payload["admission_id"]
+
+    def submit(self, make: Any) -> Any:
+        """Run ``make(connection)`` on the observer's loop; a concurrent future."""
+        return asyncio.run_coroutine_threadsafe(make(self.conn), self.loop)
+
+    def call(self, make: Any, timeout: float = ACK_TIMEOUT_SECONDS) -> Any:
+        return self.submit(make).result(timeout)
+
+    def stop(self) -> None:
+        """Ask the observer to close its connection (callable from any thread)."""
+        if self._stop is not None and self.loop is not None and not self.closed:
+            with contextlib.suppress(RuntimeError):
+                self.loop.call_soon_threadsafe(self._stop.set)
+
+    async def idle(self) -> None:
+        """Keep reading until stopped; give up a paused task at its follow limit. Raises what ended the pump."""
+        while self._pump_task is not None and not self._stop.is_set():
+            wait = 1.0 if self.deadline is None else max(0.0, min(1.0, self.deadline - time.monotonic()))
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(wait):
+                    await self._stop.wait()
+            if self.deadline is not None and not self.busy and time.monotonic() >= self.deadline:
+                self.deadline = None
+                self.plugin._follow_limit(self.task_id, self)
+        if self.error is not None:
+            raise self.error
+        # A connection with no event stream (nothing to read) has nothing to follow.
 
 
 # Process states of a process that no longer runs: Linux /proc letters, then psutil names (macOS).
@@ -396,6 +541,15 @@ def _ended_by_stop(task: dict, last: dict) -> bool:
     cuts = [e["queued_at"] for e in list(task.get("outbox") or []) + list(task.get("notices") or [])
             if e.get("kind") == "wait_lost"]
     return bool(cuts) and 0 <= max(cuts) - ended <= STOP_GRACE_SECONDS
+
+
+def _cut_approvals(task: dict) -> list[dict]:
+    """The approvals a restart ended: the open ones, else the last one a stop withdrew or left unwatched."""
+    approvals = list(_approvals(task).values())
+    last = task.get("last_approval") or {}
+    if not approvals and (last.get("outcome") == "watch_lost" or _ended_by_stop(task, last)):
+        approvals = [last]
+    return approvals
 
 
 def _approvals(task: dict) -> dict[str, dict]:
@@ -565,10 +719,27 @@ class ProfileTasks:
         self._turn_lock = threading.RLock()
         # task_id -> tool call ids of the target turn that started and have not completed yet.
         self._open_calls: dict[str, set[str]] = {}
+        # task_id -> the observer that follows the task's session in this process.
+        self._observers: dict[str, _Observer] = {}
+        self._observers_lock = threading.Lock()
+        # Set by register() when the queued-turn and background-command internals are missing.
+        self.soft_missing: list[str] = []
+        self.retry_seconds = OUTBOX_RETRY_SECONDS
+        self._retry_thread: threading.Thread | None = None
 
     def _gateway_host(self) -> bool:
         """True once this process runs a gateway that accepts plugin messages."""
         return bool(getattr(getattr(self.ctx, "_manager", None), "has_gateway_message_injector", False))
+
+    @staticmethod
+    def _gateway_stopping() -> bool:
+        """True while the gateway running this plugin drains or stops; False when that cannot be read."""
+        try:
+            from gateway import run_api
+            runner = getattr(run_api, "_ACTIVE_RUNNER", None)
+            return runner is not None and bool(getattr(runner, "_draining", False) or not getattr(runner, "_running", True))
+        except Exception:  # noqa: BLE001 - an unreadable flag means the gateway is taken as live
+            return False
 
     # settings
     def _wait_seconds(self) -> float:
@@ -577,6 +748,13 @@ class ProfileTasks:
             return float(value)
         except (TypeError, ValueError):
             return float(DEFAULT_WAIT_SECONDS)
+
+    def _follow_seconds(self) -> float:
+        value = self.ctx.get_config("follow_timeout_seconds", DEFAULT_FOLLOW_SECONDS)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(DEFAULT_FOLLOW_SECONDS)
 
     # profiles
     def _caller_profile(self) -> str:
@@ -696,7 +874,7 @@ class ProfileTasks:
         if task is None:
             raise ValueError(f"unknown key {key}")
         row = self.status(task["task_id"])["tasks"][0]
-        keep = ("task_id", "profile", "status", "session_id", "link", "answer", "error", "pending_approval")
+        keep = ("task_id", "profile", "status", "session_id", "link", "answer", "update", "error", "pending_approval")
         out = {"key": task["key"], **{k: row[k] for k in keep if row.get(k) is not None}}
         current = self.store.get(task["task_id"]) or {}
         # Wait limit, approvals, MCP sign-in and restart notices; the answer itself is in ``answer``.
@@ -717,19 +895,21 @@ class ProfileTasks:
         if not text.strip():
             raise ValueError("text is required")
         from gateway.session_context import bound_session_key
-        # Read before the lock: the receipt is a network call of up to ACK_TIMEOUT_SECONDS.
-        read = self._read_turn(task)
+        # A followed session says itself whether a turn runs; else read the receipt before the lock: a network call.
+        observer = self._live_observer(task_id)
+        read = None if observer is not None else self._read_turn(task)
         with self._send_lock:
             # Re-read under the lock: a concurrent follow_up may have reserved the next turn since the read above.
             task = self.store.get(task_id) or task
-            running = self._running_turn(task, read)
+            running = self._running_turn(task, read) if observer is None else self._observer_turn(task, observer)
             if running:
                 raise ValueError(
                     f"task {task_id} has a turn running in {task['profile']} ({running}). A follow_up now would "
                     f"start a second turn on the same task. Use action=correct to change the running turn, or "
                     f"send the follow_up after its answer arrives.")
             # The previous turn's answer, error and admission must not pass for this turn's in status or result().
-            fields = {"status": "starting", "last_answer": None, "error": None, "admission_id": None,
+            fields = {"status": "starting", "last_answer": None, "last_update": None, "error": None,
+                      "admission_id": None,
                       "waiter": _process_token(os.getpid()), "turn_token": uuid.uuid4().hex}
             if not keyed:
                 bound = bound_session_key()
@@ -745,6 +925,15 @@ class ProfileTasks:
         if not task.get("admission_id"):
             return None
         return {**self._run_async(self._read_receipt_ok(task)), "admission_id": task["admission_id"]}
+
+    @staticmethod
+    def _observer_turn(task: dict, observer: _Observer) -> str | None:
+        """Why a followed task's turn counts as running (a short reason), or None when a follow_up may start."""
+        if task.get("status") == "starting" and _waiter_alive(task.get("waiter")):
+            return "being submitted"
+        if task.get("status") in WAITING:
+            return "a turn is running"
+        return "a turn is running" if observer.busy else None
 
     @staticmethod
     def _running_turn(task: dict, read: dict | None) -> str | None:
@@ -804,76 +993,301 @@ class ProfileTasks:
                 self._record(task_id, turn, status="failed", error=error, waiter=None)
                 ready.set()
             else:
-                task = self.store.get(task_id) or {}
-                # A newer turn's approval is not this worker's to drop.
-                lost = (self._drop_dead_approval(task_id, "the plugin lost its connection to the target session")
-                        if turn is None or task.get("turn_token") == turn else "")
-                check = ("result() reads it" if task.get("key")
-                         else f"Check with profile_task action=status task_id={task_id}")
-                head = _label(task_id, task) if task.get("key") else f"Task {task_id}"
-                self._deliver(task_id, f"{head}: the wait for the answer was cut off ({error}). The work in "
-                                       f"the target session may still finish. {check}.{lost}", status="wait_lost",
-                              error=error, kind="wait_lost", turn=turn)
+                self._wait_cut(task_id, turn, error)
+
+    def _wait_cut(self, task_id: str, turn: str | None, error: str) -> None:
+        """The plugin lost its connection to the target session: record it and tell the manager."""
+        if self._gateway_stopping():
+            # The gateway is stopping: the task stays as it is for recover_after_restart.
+            return
+        task = self.store.get(task_id) or {}
+        if task.get("status") not in (*WAITING, "waiting_timeout", "waiting_subwork"):
+            # The task already ended (the observer closing cuts the connection of its own last wait).
+            return
+        if task.get("status") == "waiting_subwork":
+            # The observer of a paused task is not tied to one turn.
+            turn = None
+        # A newer turn's approval is not this worker's to drop.
+        lost = (self._drop_dead_approval(task_id, "the plugin lost its connection to the target session")
+                if turn is None or task.get("turn_token") == turn else "")
+        check = ("result() reads it" if task.get("key")
+                 else f"Check with profile_task action=status task_id={task_id}")
+        head = _label(task_id, task) if task.get("key") else f"Task {task_id}"
+        self._deliver(task_id, f"{head}: the wait for the answer was cut off ({error}). The work in "
+                               f"the target session may still finish. {check}.{lost}", status="wait_lost",
+                      error=error, kind="wait_lost", turn=turn)
 
     async def _send_and_wait(self, task_id: str, text: str, create: bool, accepted: dict,
                              ready: threading.Event) -> None:
         task = self.store.get(task_id)
         # Read before the target accepts the text: no follow_up can replace it until then.
         turn = task.get("turn_token")
-        async with _Connection(self._home(task["profile"]),
-                               on_frame=lambda frame: self._on_target_frame(task_id, frame, turn)) as conn:
-            if create:
-                snapshot = await conn.rpc("session.create", source="gui", request_id=task_id, title=task["title"])
-                session_id = snapshot["session_id"]
-                self.store.update(task_id, session_id=session_id)
-                payload = f"{text}\n\n[{TARGET_GUIDANCE}]"
-            else:
-                session_id = task["session_id"]
-                await conn.rpc("session.resume", session_id=session_id, omit_messages=True)
-                payload = text
-            submission_id = uuid.uuid4().hex
-            with self._turn_lock:
-                # Tool calls of an earlier turn that never reported back cannot gate this turn's approvals.
-                self._open_calls.pop(task_id, None)
-            receipt = await conn.rpc("prompt.submit", session_id=session_id, text=payload,
-                                     submission_id=submission_id)
-            admission_id = receipt["admission_id"]
-            turns = list(self.store.get(task_id).get("turns") or []) + [admission_id]
-            self.store.update(task_id, status="running", admission_id=admission_id, turns=turns,
-                              waiter=_process_token(os.getpid()))
-            ready.set()
-            await self._check_mcp_auth(conn, task_id)
-            deadline = time.monotonic() + self._wait_seconds()
-            try:
-                final = await conn.wait_terminal(session_id, admission_id, deadline)
-                # Servers that failed during the turn, before its answer is delivered.
-                await self._check_mcp_auth(conn, task_id)
-            except TimeoutError:
-                minutes = round(self._wait_seconds() / 60, 1)
-                self._deliver(task_id, _wait_limit_text(task_id, task, minutes), status="waiting_timeout",
-                              kind="wait_limit", turn=turn)
-                # Keep relaying approvals until the turn ends; status reads the answer itself.
-                with contextlib.suppress(TimeoutError):
-                    await conn.wait_terminal(session_id, admission_id, time.monotonic() + APPROVAL_WATCH_SECONDS)
-                # Servers that failed after the wait limit, before the watch ends.
-                await self._check_mcp_auth(conn, task_id)
+        live = None if create else self._live_observer(task_id)
+        if live is not None:
+            # The task's observer already holds the session: the text goes through its connection.
+            await asyncio.wrap_future(live.submit(lambda _conn: self._submit_and_wait(
+                live, task_id, text, False, accepted, ready, turn, resume=False)))
+            return
+        async with _Observer(self, task_id, self._home(task["profile"])) as observer:
+            await self._submit_and_wait(observer, task_id, text, create, accepted, ready, turn, resume=not create)
+            # The turns that follow arrive by themselves; the observer stays until the task's real end.
+            await observer.idle()
+
+    async def _submit_and_wait(self, observer: _Observer, task_id: str, text: str, create: bool, accepted: dict,
+                               ready: threading.Event, turn: str | None, *, resume: bool) -> None:
+        """Submit *text* on the observer's connection and wait for that turn; its end is handled by the observer."""
+        conn = observer.conn
+        task = self.store.get(task_id)
+        if create:
+            snapshot = await conn.rpc("session.create", source="gui", request_id=task_id, title=task["title"])
+            session_id = snapshot["session_id"]
+            self.store.update(task_id, session_id=session_id, stored_session_id=snapshot.get("stored_session_id"))
+            payload = f"{text}\n\n[{TARGET_GUIDANCE}]"
+        else:
+            session_id = task["session_id"]
+            if resume:
+                resumed = await conn.rpc("session.resume", session_id=session_id, omit_messages=True)
+                if isinstance(resumed, dict) and resumed.get("stored_session_id"):
+                    self.store.update(task_id, stored_session_id=resumed["stored_session_id"])
+            payload = text
+        submission_id = uuid.uuid4().hex
+        with self._turn_lock:
+            # Tool calls of an earlier turn that never reported back cannot gate this turn's approvals.
+            self._open_calls.pop(task_id, None)
+        observer.busy, observer.deadline, observer.turn_admission = True, None, None
+        receipt = await conn.rpc("prompt.submit", session_id=session_id, text=payload, submission_id=submission_id)
+        admission_id = receipt["admission_id"]
+        observer.turn_admission = admission_id
+        turns = list(self.store.get(task_id).get("turns") or []) + [admission_id]
+        self.store.update(task_id, status="running", admission_id=admission_id, turns=turns,
+                          waiter=_process_token(os.getpid()))
+        ready.set()
+        await self._check_mcp_auth(conn, task_id)
+        deadline = time.monotonic() + self._wait_seconds()
+        try:
+            final = await conn.wait_terminal(session_id, admission_id, deadline)
+        except TimeoutError:
+            minutes = round(self._wait_seconds() / 60, 1)
+            self._deliver(task_id, _wait_limit_text(task_id, task, minutes), status="waiting_timeout",
+                          kind="wait_limit", turn=turn)
+            # The observer keeps following the session; its turn end still reaches the manager.
+            observer.deadline = time.monotonic() + self._follow_seconds()
+            self._end_calls(task_id, turn)
+            return
+        if admission_id not in observer.ended:
+            # No end frame came with the receipt: the receipt is the only record of this turn.
+            ok, body = _final_text(final)
+            if not ok and self._gateway_stopping():
+                # The stop cut the turn: left for recover_after_restart.
                 self._end_calls(task_id, turn)
                 return
+            await self._turn_ended(task_id, {"session_id": session_id, "type": "message.complete", "payload": {
+                "admission_id": admission_id, "text": body if ok else "", "status": "complete" if ok else "error",
+                "error": None if ok else body}}, observer)
         self._end_calls(task_id, turn)
-        ok, body = _final_text(final)
-        if ok:
-            message = f"Answer from {task['profile']} for task {task_id} (session {session_id}):\n\n{body}"
-            self._deliver(task_id, message, status="answered", last_answer=body, turn=turn)
-        else:
-            message = (f"Task {task_id} ({task['profile']}) did not complete: {body}\n"
-                       f"The {task['profile']} session {session_id} still exists.")
-            self._deliver(task_id, message, status="failed", error=body, turn=turn)
+
+    def _live_observer(self, task_id: str) -> _Observer | None:
+        with self._observers_lock:
+            observer = self._observers.get(task_id)
+        if observer is None or observer.closed or observer.loop is None or observer.loop.is_closed():
+            return None
+        return None if observer._stop is not None and observer._stop.is_set() else observer
+
+    def _ensure_observer(self, task_id: str) -> _Observer:
+        """The task's live observer, starting one (it resumes the session) when none lives, e.g. after a restart."""
+        observer = self._live_observer(task_id)
+        if observer is not None:
+            return observer
+        ready = threading.Event()
+        box: dict = {}
+        context = contextvars.copy_context()
+        thread = threading.Thread(target=context.run, args=(self._run_observer, task_id, ready, box),
+                                  name=f"profile-task-observer-{task_id}", daemon=True)
+        thread.start()
+        if not ready.wait(ACK_TIMEOUT_SECONDS):
+            raise RuntimeError(f"the target gateway did not take the session of task {task_id} in {ACK_TIMEOUT_SECONDS}s")
+        if "error" in box:
+            raise RuntimeError(box["error"])
+        return box["observer"]
+
+    def _run_observer(self, task_id: str, ready: threading.Event, box: dict) -> None:
+        try:
+            asyncio.run(self._observe(task_id, ready, box))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("profile-tasks: following task %s failed", task_id, exc_info=True)
+            error = f"{exc.__class__.__name__}: {exc}"
+            if not ready.is_set():
+                box["error"] = error
+                ready.set()
+            else:
+                self._wait_cut(task_id, None, error)
+
+    async def _observe(self, task_id: str, ready: threading.Event, box: dict) -> None:
+        task = self.store.get(task_id) or {}
+        async with _Observer(self, task_id, self._home(task["profile"])) as observer:
+            resumed = await observer.conn.rpc("session.resume", session_id=task["session_id"], omit_messages=True)
+            if isinstance(resumed, dict) and resumed.get("stored_session_id"):
+                self.store.update(task_id, stored_session_id=resumed["stored_session_id"])
+            box["observer"] = observer
+            ready.set()
+            await observer.idle()
 
     def _end_calls(self, task_id: str, turn: str | None) -> None:
         """Forget the task's open tool calls once *turn* stopped watching, unless a newer turn owns the task."""
         with self._turn_lock:
             if turn is None or (self.store.get(task_id) or {}).get("turn_token") == turn:
                 self._open_calls.pop(task_id, None)
+
+    # the end of every turn of a followed session
+    async def _turn_ended(self, task_id: str, frame: dict, observer: _Observer) -> None:
+        """A turn of the task's session ended, whoever started it: tell the manager, finished or not."""
+        payload = frame.get("payload") or {}
+        task = self.store.get(task_id) or {}
+        if frame.get("session_id") not in (None, task.get("session_id")):
+            return
+        if payload.get("status") in ("interrupted", "error") and self._gateway_stopping():
+            # The stop cut this turn: left as is, recover_after_restart reports it at the next load.
+            return
+        admission = payload.get("admission_id")
+        if admission and admission in observer.ended:
+            return
+        if admission:
+            observer.ended.add(admission)
+        # Servers that failed during the turn, before its end is told.
+        if observer.conn is not None:
+            await self._check_mcp_auth(observer.conn, task_id)
+        task = self.store.get(task_id) or {}
+        submitted = (admission == task.get("admission_id") if admission
+                     else task.get("status") in (*WAITING, "waiting_timeout"))
+        if submitted and task.get("status") in ("answered", "failed") and task.get("delivered_by") == "status":
+            # status already handed this turn's end to the manager past the wait limit.
+            observer.deadline = None
+            observer.stop()
+            return
+        if not submitted:
+            known = list(task.get("turns") or [])
+            turn_id = admission or f"observed-{sum(1 for t in known if str(t).startswith('observed-')) + 1}"
+            self.store.update(task_id, turns=known + [turn_id], **({"admission_id": admission} if admission else {}))
+        status = payload.get("status") or "complete"
+        text = payload.get("text")
+        text = text if isinstance(text, str) else ("" if text is None else json.dumps(text))
+        self.store.update(task_id, told_text=text)
+        failure = ""
+        if status != "complete":
+            cause = payload.get("error") or payload.get("failure_reason") or status
+            failure = f"{cause}" + (f"\n\nPartial answer:\n{text}" if text and text != cause else "")
+        reasons = self._pause_reasons(task, text)
+        profile, session_id = task.get("profile"), task.get("session_id")
+        if reasons:
+            what = ", ".join(reasons)
+            lead = (f"Update from {profile} for task {task_id} (session {session_id}). Not finished: it is "
+                    f"waiting on {what}. Its next turns will arrive here on their own; end your turn without a "
+                    f"follow_up.")
+            if task.get("key"):
+                lead = f"Update from {profile} for {_label(task_id, task)}. Not finished: it is waiting on {what}."
+            body = f"this turn failed: {failure}" if failure else text
+            observer.deadline = time.monotonic() + self._follow_seconds()
+            self._deliver(task_id, f"{lead}\n\n{body}", status="waiting_subwork", kind="update",
+                          last_update=text, pause_reasons=reasons, paused_at=time.time(), last_answer=None,
+                          error=failure or None)
+            return
+        observer.deadline = None
+        if failure:
+            message = (f"Task {task_id} ({profile}) did not complete: {failure}\n"
+                       f"The {profile} session {session_id} still exists.")
+            self._deliver(task_id, message, status="failed", error=failure, pause_reasons=None)
+        else:
+            message = f"Answer from {profile} for task {task_id} (session {session_id}), finished:\n\n{text}"
+            self._deliver(task_id, message, status="answered", last_answer=text, last_update=None,
+                          pause_reasons=None, error=None)
+        observer.stop()
+
+    def _pause_reasons(self, task: dict, text: str) -> list[str]:
+        """Why the task is not finished after this turn (empty: it is finished); see the README for the rule."""
+        reasons = [f"task {tid} ({profile})" for tid, profile in self._open_subtasks(task)]
+        if not any(m.startswith(LIVE_SESSION_INTERNALS) for m in self.soft_missing):
+            session = self._live_session(task)
+            if session is not None:
+                if session.get("queued_prompt"):
+                    reasons.append("a queued turn")
+                if self._owns_background_command(session):
+                    reasons.append("a background command")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if lines and lines[-1].startswith("WAITING:"):
+            reasons.append(lines[-1][len("WAITING:"):].strip() or "something it started")
+        return reasons
+
+    @staticmethod
+    def _owns_background_command(session: dict) -> bool:
+        try:
+            from tui_gateway import session_notifications
+            return bool(session_notifications._session_owns_pending_process_notification(session))
+        except Exception:  # noqa: BLE001 - Hermes internals; the other conditions still apply
+            logger.warning("profile-tasks: background commands of a session could not be read", exc_info=True)
+            return False
+
+    @staticmethod
+    def _live_session(task: dict) -> dict | None:
+        """The task session's record in this process's gateway, or None when this process does not hold it."""
+        served = sys.modules.get("tui_gateway.server")
+        if served is None or not hasattr(served, "_sessions"):
+            return None
+        with served._sessions_lock:
+            session = served._sessions.get(task.get("session_id"))
+            stored = task.get("stored_session_id")
+            if session is None and stored:
+                session = next((s for s in served._sessions.values()
+                                if isinstance(s, dict) and s.get("session_key") == stored), None)
+        return session if isinstance(session, dict) else None
+
+    def _open_subtasks(self, task: dict) -> list[tuple[str, str]]:
+        """(task id, profile) of the target profile's tasks started from this session that are not over.
+
+        Not over: still starting, running, waiting or paused, or finished with the result not yet handed to the session.
+        """
+        ids = {i for i in (task.get("session_id"), task.get("stored_session_id")) if i}
+        found = []
+        for sub_id, sub in self._read_profile_tasks(task["profile"]).items():
+            if not isinstance(sub, dict) or sub.get("caller_session_id") not in ids:
+                continue
+            if sub.get("status") in OPEN_SUBTASK_STATES or sub.get("delivered") is False:
+                found.append((sub.get("task_id") or sub_id, sub.get("profile") or "?"))
+        return found
+
+    @staticmethod
+    def _read_profile_tasks(profile: str) -> dict[str, dict]:
+        """The tasks in *profile*'s plugin state, read under that profile's tasks.lock and never written."""
+        from hermes_cli.plugins_state import PluginState
+        folder = ProfileTasks._home(profile) / "plugin-data" / PluginState(PLUGIN_ID).data_dir.name
+        try:
+            try:
+                lock = open(folder / "tasks.lock", "rb")
+            except FileNotFoundError:
+                # No writer ever took the lock: nothing can be half written.
+                lock = contextlib.nullcontext()
+            with lock:
+                if hasattr(lock, "fileno"):
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+                data = json.loads((folder / "state.json").read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            logger.warning("profile-tasks: the tasks of %s could not be read", profile, exc_info=True)
+            return {}
+        tasks = data.get(STATE_KEY) if isinstance(data, dict) else None
+        return tasks if isinstance(tasks, dict) else {}
+
+    def _follow_limit(self, task_id: str, observer: _Observer) -> None:
+        """A paused task got no new turn for the follow limit: tell the manager, close the observer."""
+        task = self.store.get(task_id) or {}
+        if task.get("status") == "waiting_subwork":
+            seconds = self._follow_seconds()
+            span = f"{round(seconds / 3600, 1):g} h" if seconds >= 3600 else f"{seconds:g} s"
+            what = ", ".join(task.get("pause_reasons") or ["something it started"])
+            self._deliver(task_id, f"{_label(task_id, task)}: no news for {span}; it was "
+                                   f"waiting on {what}; the session still exists; check with status",
+                          status="follow_lost", kind="follow_limit", waiter=None)
+        observer.stop()
 
     # approvals raised in a target session
     def _on_target_frame(self, task_id: str, frame: dict, turn: str | None = None) -> None:
@@ -1228,14 +1642,23 @@ class ProfileTasks:
         return _approval_fields(approvals)
 
     async def _respond(self, task: dict, pending: dict, choice: str) -> dict:
+        observer = self._live_observer(task["task_id"]) if task.get("task_id") else None
+        if observer is not None and observer.loop is asyncio.get_running_loop():
+            return await self._respond_on(observer.conn, task, pending, choice)
+        if observer is not None:
+            return await asyncio.wrap_future(observer.submit(
+                lambda conn: self._respond_on(conn, task, pending, choice)))
         async with _Connection(self._home(task["profile"])) as conn:
             await conn.rpc("session.resume", session_id=task["session_id"], omit_messages=True)
-            try:
-                result = await conn.rpc("approval.respond", session_id=task["session_id"],
-                                        execution_generation=pending["execution_generation"],
-                                        prompt_id=pending["prompt_id"], choice=choice)
-            except Exception as exc:  # noqa: BLE001 - returned to the manager as the outcome
-                return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+            return await self._respond_on(conn, task, pending, choice)
+
+    async def _respond_on(self, conn: Any, task: dict, pending: dict, choice: str) -> dict:
+        try:
+            result = await conn.rpc("approval.respond", session_id=task["session_id"],
+                                    execution_generation=pending["execution_generation"],
+                                    prompt_id=pending["prompt_id"], choice=choice)
+        except Exception as exc:  # noqa: BLE001 - returned to the manager as the outcome
+            return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
         # The gateway answers {"status": "already_resolved"} without raising when the prompt had already ended.
         if not isinstance(result, dict) or result.get("status") != "resolved":
             return {"ok": False, "error": "the request had already ended in the target session", "result": result}
@@ -1353,9 +1776,51 @@ class ProfileTasks:
         """Close out tasks whose waiting process is gone; queue one notice each. Returns their ids."""
         found = [task_id for task_id in self.store.all()
                  if self.store.modify(task_id, lambda task, tid=task_id: self._close_cut_off(tid, task))]
+        for task_id in list(self.store.all()):
+            if self.store.modify(task_id, lambda task, tid=task_id: self._follow_again_fields(tid, task)):
+                threading.Thread(target=self._follow_again, args=(task_id,), name=f"profile-task-follow-{task_id}",
+                                 daemon=True).start()
         if any(task.get("outbox") for task in self.store.all().values()):
             threading.Thread(target=self._flush_when_hosted, name="profile-tasks-load", daemon=True).start()
         return found
+
+    @staticmethod
+    def _follow_again_fields(task_id: str, task: dict) -> dict | None:
+        """Fields that hand a paused task whose process is gone to this process, with the restart notice queued."""
+        if task.get("status") != "waiting_subwork" or not task.get("waiter") or _waiter_alive(task.get("waiter")):
+            return None
+        what = ", ".join(task.get("pause_reasons") or ["something it started"])
+        text = f"{_label(task_id, task)}: the gateway restarted while task {task_id} was waiting on {what}; it is followed again."
+        fields: dict = {"waiter": _process_token(os.getpid()), "paused_at": time.time()}
+        approvals = _cut_approvals(task)
+        if approvals:
+            fields.update(_approval_fields({}))
+        profile = task.get("profile")
+        for approval in approvals:
+            fields["last_approval"] = {**approval, "outcome": "interrupted", "settled_at": time.time()}
+            text += (f" The approval for `{approval.get('command')}` ended with the restart: whether the command "
+                     f"ran is unknown; check the {profile} session before running it again.")
+        fields["outbox"] = list(task.get("outbox") or []) + [_notice(text, "restart")]
+        return fields
+
+    def _follow_again(self, task_id: str) -> None:
+        """Give a paused task an observer again after a restart: it resumes the session."""
+        try:
+            observer = self._ensure_observer(task_id)
+            observer.deadline = time.monotonic() + self._follow_seconds()
+        except Exception as exc:  # noqa: BLE001 - reported to the manager as a lost wait
+            logger.warning("profile-tasks: task %s could not be followed again", task_id, exc_info=True)
+            self._wait_cut(task_id, None, f"{exc.__class__.__name__}: {exc}")
+
+    def _retry_loop(self) -> None:
+        """Try an undelivered notice again every retry_seconds while this plugin load lives."""
+        while _PLUGIN is self:
+            time.sleep(self.retry_seconds)
+            try:
+                if self._gateway_host():
+                    self._flush_outbox("retry")
+            except Exception:  # noqa: BLE001 - the next round tries again
+                logger.warning("profile-tasks: the notice retry failed", exc_info=True)
 
     @staticmethod
     def _close_cut_off(task_id: str, task: dict) -> dict | None:
@@ -1365,12 +1830,12 @@ class ProfileTasks:
         """
         if not task.get("waiter") or _waiter_alive(task.get("waiter")):
             return None
+        if task.get("status") == "waiting_subwork":
+            # A paused task is followed again by _follow_again_fields, which also ends its cut approvals.
+            return None
         # A stop can cut the wait (wait_lost) or end the approval watch just before the process exits.
         waiting = task.get("status") in WAITING or task.get("status") == "wait_lost"
-        approvals = list(_approvals(task).values())
-        last = task.get("last_approval") or {}
-        if not approvals and (last.get("outcome") == "watch_lost" or _ended_by_stop(task, last)):
-            approvals = [last]
+        approvals = _cut_approvals(task)
         if not waiting and not approvals:
             return None
         profile, session_id = task.get("profile"), task.get("session_id")
@@ -1442,13 +1907,19 @@ class ProfileTasks:
                 "note": "The turn may already be finished. Use action=follow_up to send it as the next message."}
 
     async def _steer(self, task: dict, text: str) -> Any:
+        observer = self._live_observer(task["task_id"]) if task.get("task_id") else None
+        if observer is not None:
+            return await asyncio.wrap_future(observer.submit(lambda conn: self._steer_on(conn, task, text)))
         async with _Connection(self._home(task["profile"])) as conn:
-            receipt = await conn.rpc("prompt.receipt", session_id=task["session_id"], admission_id=task["admission_id"])
-            generation = receipt.get("execution_generation")
-            if receipt["status"] != "started" or generation is None:
-                return {"status": "rejected", "reason": f"turn is {receipt['status']}"}
-            return await conn.rpc("session.steer", session_id=task["session_id"], execution_generation=generation,
-                                  text=text)
+            return await self._steer_on(conn, task, text)
+
+    async def _steer_on(self, conn: Any, task: dict, text: str) -> Any:
+        receipt = await conn.rpc("prompt.receipt", session_id=task["session_id"], admission_id=task["admission_id"])
+        generation = receipt.get("execution_generation")
+        if receipt["status"] != "started" or generation is None:
+            return {"status": "rejected", "reason": f"turn is {receipt['status']}"}
+        return await conn.rpc("session.steer", session_id=task["session_id"], execution_generation=generation,
+                              text=text)
 
     def status(self, task_id: str | None) -> dict:
         tasks = self.store.all()
@@ -1465,7 +1936,8 @@ class ProfileTasks:
                                                            or task.get("settling_approval")):
                 self._drop_dead_approval(tid, "the process that watched the target session is gone")
                 tasks[tid] = self.store.get(tid) or task
-            if task.get("status") in REFRESHABLE and not (task.get("status") in WAITING and _waiter_alive(task.get("waiter"))):
+            followed = task.get("status") in (*WAITING, "waiting_subwork") and _waiter_alive(task.get("waiter"))
+            if task.get("status") in REFRESHABLE and not followed:
                 extra[tid] = self._refresh(task)
                 tasks[tid] = self.store.get(tid) or task
         keep = ("task_id", "profile", "status", "session_id", "title", "delivered", "error", "created_at", "updated_at")
@@ -1480,6 +1952,9 @@ class ProfileTasks:
                 row["last_approval"] = {k: t["last_approval"].get(k) for k in ("command", "outcome", "user_summary")}
             if t.get("outbox"):
                 row["notices_not_delivered"] = [e["text"] for e in t["outbox"]]
+            if t.get("status") == "waiting_subwork" and t.get("last_update"):
+                row["update"] = t["last_update"]
+                row["waiting_on"] = t.get("pause_reasons")
             if task_id and t.get("last_answer") and "answer" not in extra.get(tid, {}):
                 row["answer"] = t["last_answer"]
             if "answer" in row or "answer" in extra.get(tid, {}):
@@ -1508,6 +1983,8 @@ class ProfileTasks:
                             f"so no answer was injected. ")
         else:
             restart_note = ""
+        if task.get("status") == "follow_lost":
+            return self._refresh_lost(task, turn)
         if not session_id or not task.get("admission_id"):
             error = "the gateway restarted before the target accepted the task" if restarted else "not accepted yet"
             if restarted and not self._record(task_id, turn, status="failed", error=error):
@@ -1540,12 +2017,20 @@ class ProfileTasks:
                                             f"not cancelled. Check back later with action=status."}
         ok, body = _final_text(receipt)
         if ok:
-            if not self._record(task_id, turn, status="answered", last_answer=body, delivered=True,
-                                delivered_by="status"):
+            closed = (self.store.get(task_id) or {}).get("status") in ("answered", "failed")
+            if closed or not self._record(task_id, turn, open_only=True, status="answered", last_answer=body,
+                                          delivered=True, delivered_by="status"):
+                if (self.store.get(task_id) or {}).get("status") in ("answered", "failed"):
+                    # The observer ended the task while the receipt was read: its notice carries the answer.
+                    return {}
                 return newer
             return {"turn": state, "answer": body,
                     "note": f"{restart_note}Answer read from the {profile} session after the wait ended."}
-        if not self._record(task_id, turn, status="failed", error=body, delivered=True, delivered_by="status"):
+        if not self._record(task_id, turn, open_only=True, status="failed", error=body, delivered=True,
+                            delivered_by="status"):
+            if (self.store.get(task_id) or {}).get("status") in ("answered", "failed"):
+                # The observer ended the task while the receipt was read: its notice carries the end.
+                return {}
             return newer
         if state == "unknown":
             return {"turn": state, "note": (
@@ -1555,11 +2040,67 @@ class ProfileTasks:
         return {"turn": state, "note": f"{restart_note}The turn did not complete: {body}. The {profile} "
                                        f"session {session_id} still exists."}
 
-    def _record(self, task_id: str, turn: str | None, **fields: Any) -> bool:
-        """Store *fields* only while *turn* still owns the task; False when a follow_up started a newer turn."""
+    def _refresh_lost(self, task: dict, turn: str | None) -> dict:
+        """A task given up at the follow limit: say whether its session still runs and what its sub-tasks do."""
+        task_id, profile, session_id = task["task_id"], task["profile"], task["session_id"]
+        box: dict = {}
+
+        async def read() -> None:
+            async with _Connection(self._home(profile)) as conn:
+                box["info"] = await conn.rpc("session.info", session_id=session_id)
+                if not (box["info"] or {}).get("running"):
+                    box["resumed"] = await conn.rpc("session.resume", session_id=session_id)
+
+        try:
+            self._run_blocking(read())
+        except Exception as exc:  # noqa: BLE001 - reported to the manager as the status
+            return {"note": f"Could not read the {profile} session {session_id}: {exc.__class__.__name__}: {exc}."}
+        info = box.get("info") if isinstance(box.get("info"), dict) else {}
+        subtasks = [{"task_id": tid, "profile": p} for tid, p in self._open_subtasks(task)]
+        out: dict = {"waiting_on_subtasks": subtasks} if subtasks else {}
+        resumed = box.get("resumed") if isinstance(box.get("resumed"), dict) else {}
+        last = next((m for m in reversed(resumed.get("messages") or [])
+                     if isinstance(m, dict) and m.get("role") == "assistant"), None)
+        body = str((last or {}).get("text") or (last or {}).get("content") or "")
+        if info.get("running") is False and body.strip() and body != task.get("told_text"):
+            if self._record(task_id, turn, status="answered", last_answer=body, delivered=True,
+                            delivered_by="status", told_text=body):
+                return {**out, "answer": body, "note": "A later turn of the session ended after the follow "
+                        "limit; this is its last answer."}
+        if info.get("running"):
+            return {**out, "note": f"The {profile} session {session_id} is still running a turn."}
+        return {**out, "note": f"The {profile} session {session_id} is idle; no turn ended since the follow limit."}
+
+    @staticmethod
+    def _run_blocking(coro: Any) -> None:
+        box: dict = {}
+
+        def run() -> None:
+            try:
+                asyncio.run(coro)
+            except Exception as exc:  # noqa: BLE001
+                box["error"] = exc
+
+        thread = threading.Thread(target=contextvars.copy_context().run, args=(run,), daemon=True)
+        thread.start()
+        thread.join(ACK_TIMEOUT_SECONDS)
+        if "error" in box:
+            raise box["error"]
+
+    def _record(self, task_id: str, turn: str | None, open_only: bool = False, **fields: Any) -> bool:
+        """Store *fields* only while *turn* still owns the task; False when a follow_up started a newer turn.
+
+        With *open_only*, also False when the task is already answered or failed.
+        """
         if fields.get("status") in ("answered", "failed"):
             fields["waiter"] = None
-        return self.store.modify(task_id, lambda task: fields if task.get("turn_token") == turn else None) is not None
+
+        def change(task: dict) -> dict | None:
+            if task.get("turn_token") != turn:
+                return None
+            return None if open_only and task.get("status") in ("answered", "failed") else fields
+
+        return self.store.modify(task_id, change) is not None
 
     async def _read_receipt(self, task: dict) -> dict:
         async with _Connection(self._home(task["profile"])) as conn:
@@ -1574,7 +2115,9 @@ SCHEMA = {
         "gateway. The task runs in its own session under that profile, with its own tools, MCP servers and "
         "tokens. action=start returns at once with a task id and the session; the final answer arrives later "
         "in this conversation as a new message, so end your turn after starting. action=follow_up sends a "
-        "new message in the same task session once its turn has ended (refused while it runs). action=correct "
+        "new message in the same task session once its turn has ended (refused while it runs). A task is followed "
+        "to its real end: updates arrive here by themselves while it waits on its own work, and the last message "
+        "says finished. action=correct "
         "steers the turn that is running now. "
         "action=status lists tasks and their state; for a task nobody waits on any more (past the wait limit, "
         "or a gateway restart) it reads the target turn and returns the late answer or what happened. "
@@ -1645,12 +2188,22 @@ def result(key: str, wait: float = 0.0) -> dict:
 def register(ctx: Any) -> None:
     global _PLUGIN
     missing = check_internals(ctx)
+    soft = [m for m in missing if m.startswith(LIVE_SESSION_INTERNALS + STOP_INTERNALS)]
+    missing = [m for m in missing if m not in soft]
+    pause = [m for m in soft if m.startswith(LIVE_SESSION_INTERNALS)]
+    if pause:
+        logger.error("profile-tasks: Hermes internals missing after an update; a task is only held open for the "
+                     "tasks of its profile and a WAITING: line: %s", "; ".join(pause))
+    if len(pause) < len(soft):
+        logger.error("profile-tasks: Hermes internals missing after an update; a turn cut by a gateway stop is "
+                     "reported failed: %s", "; ".join(m for m in soft if m not in pause))
     if missing:
         logger.error("profile-tasks: Hermes internals missing after an update; the %s tool will refuse every "
                      "call until the plugin is fixed: %s", TOOL_NAME, "; ".join(missing))
     if _PLUGIN is not None:
         logger.warning("profile-tasks: registered again in this process; send() and result() now use the new load")
     plugin = _PLUGIN = ProfileTasks(ctx, missing)
+    plugin.soft_missing = soft
 
     def _forget() -> None:
         global _PLUGIN
@@ -1660,6 +2213,8 @@ def register(ctx: Any) -> None:
     if hasattr(ctx, "on_unload"):
         ctx.on_unload(_forget)
     if not missing:
+        plugin._retry_thread = threading.Thread(target=plugin._retry_loop, name="profile-tasks-retry", daemon=True)
+        plugin._retry_thread.start()
         recovered = plugin.recover_after_restart()
         if recovered:
             logger.info("profile-tasks: tasks cut off by a gateway restart: %s", ", ".join(recovered))

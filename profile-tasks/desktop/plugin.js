@@ -1,7 +1,7 @@
 // profile-tasks: a status-bar item for the background tasks of the conversation open on screen.
 // The item shows a speech bubble and the number of profile_task tasks started from that conversation; it is hidden
 // when there are none. Clicking it opens the list: target profile, title and state (running, waiting for an
-// approval, past the wait limit, answered, late answer, failed). Each entry opens the task's session in a tab, as
+// approval, waiting on its own work, past the wait or follow limit, answered, late answer, failed). Each entry opens the task's session in a tab, as
 // the @session:<profile>/<id> chip does.
 // The list comes from this package's backend (dashboard/plugin_api.py, read-only). It is read again when the open
 // conversation changes, on the backend's plugin.profile-tasks.tasks.changed event (sent on every task save), and
@@ -30,6 +30,8 @@ const STATES = {
   approval: { label: 'waiting for an approval', color: 'var(--ui-yellow)' },
   running: { label: 'running', color: 'var(--ui-blue, inherit)' },
   past_wait_limit: { label: 'past the wait limit', color: 'var(--ui-yellow)' },
+  waiting_on_own_work: { label: 'waiting on its own work', color: 'var(--ui-blue, inherit)' },
+  past_follow_limit: { label: 'no longer followed', color: 'var(--ui-yellow)' },
   wait_lost: { label: 'wait lost', color: 'var(--ui-red)' },
   answered: { label: 'answered', color: 'var(--ui-green)' },
   late_answer: { label: 'late answer', color: 'var(--ui-green)' },
@@ -126,7 +128,7 @@ function ProfileTasksStatus() {
   const tasks = (q.data && q.data.tasks) || []
   if (!open.sessionId || tasks.length === 0) return null
   const waiting = tasks.filter(t => t.state === 'approval').length
-  const running = tasks.filter(t => t.state === 'running' || t.state === 'past_wait_limit').length
+  const running = tasks.filter(t => t.state === 'running' || t.state === 'past_wait_limit' || t.state === 'waiting_on_own_work').length
   const tip = `${tasks.length} background task${tasks.length === 1 ? '' : 's'}: ${running} running` +
     (waiting ? `, ${waiting} waiting for an approval` : '')
   return h(

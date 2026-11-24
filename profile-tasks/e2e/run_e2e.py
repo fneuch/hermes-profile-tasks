@@ -86,6 +86,8 @@ def scenario_of(messages: list[dict]) -> tuple[str, int]:
 
 RELAY = {"on": False}
 APPROVAL_TIMEOUT = 10
+# Seconds a session with no viewer stays open (sessions.orphan_end_grace_s) for the implementer and reviewer.
+ORPHAN_GRACE = 10.0
 # Lets the trial close the manager conversation before the target raises its approval.
 LATE_APPROVAL_DELAY = 12
 
@@ -152,6 +154,17 @@ def analyst_model(record: dict):
         if len(tool_results) < (2 if tag == "REAUTHAGAIN" else 1):
             return ToolCall(REAUTH_TOOL, {"nonce": f"{tag.lower()}-{len(tool_results)}"})
         return Text(f"{tag}-RESULT {text_of(tool_results[-1])[:300]}", reasoning=reasoning)
+    if tag == "FLOW":
+        # FLOW (implementer): ask the reviewer and end the turn; a verdict, then CI, then the final answer.
+        last_text = text_of(messages[-1])
+        if messages[-1].get("role") == "tool":
+            return Text("Asked the reviewer, waiting for its verdict.", reasoning=reasoning)
+        if "Answer from reviewer" in last_text:
+            return Text("Verdict received, CI started.\nWAITING: CI", reasoning=reasoning)
+        if "CI-GREEN" in last_text:
+            return Text("FLOW-FINAL all done", reasoning=reasoning)
+        return ToolCall("profile_task", {"action": "start", "profile": "reviewer", "title": "flow review",
+                                         "text": "SCENARIO:VERDICT please review"})
     if tag == "SLOW":
         time.sleep(WAIT_LIMIT + 15)
         return Text("SLOW-DONE", reasoning=reasoning)
@@ -164,10 +177,18 @@ def analyst_model(record: dict):
     return Text("ANALYST-DEFAULT", reasoning=reasoning)
 
 
+REVIEW_SECONDS = 75
+
+
+def reviewer_model(record: dict):
+    time.sleep(REVIEW_SECONDS)
+    return Text("VERDICT: approved")
+
+
 # ---- isolated home ------------------------------------------------------------------------------
 
 
-def write_home(manager_url: str, analyst_url: str, remote: dict[str, str]) -> None:
+def write_home(manager_url: str, analyst_url: str, remote: dict[str, str], reviewer_url: str) -> None:
     common = {
         "agent": {"api_max_retries": 1},
         "telemetry": {"shared_metrics": {"enabled": False, "send": False, "offer_version": OFFER_VERSION}},
@@ -196,17 +217,29 @@ def write_home(manager_url: str, analyst_url: str, remote: dict[str, str]) -> No
                    mcp_servers={"atlassian": {"command": sys.executable, "args": [str(FIXTURE_MCP)],
                                               "env": {"PARITY_MCP_CANARY": CANARY, "PYTHONPATH": str(AGENT)},
                                               "connect_timeout": 60, "timeout": 60}})
-    implementer = dict(common, model=model(analyst_url), mcp_servers={
-        name: {"url": url, "connect_timeout": 15, "timeout": 30} for name, url in remote.items()})
-    homes = {"default": HH, "analyst": HH / "profiles/analyst", "implementer": HH / "profiles/implementer"}
-    for name, cfg in (("default", default), ("analyst", analyst), ("implementer", implementer)):
+    # The implementer hands work to the reviewer itself, so it runs the plugin too.
+    # A short orphan grace: a session with no viewer is closed in seconds, so trial `follow` shows the
+    # observer keeps a paused task's session open (live default: 300 s).
+    implementer = dict(common, model=model(analyst_url), plugins={
+        "enabled": ["profile-tasks"],
+        "entries": {"profile-tasks": {"allow_gateway_injection": True, "settings": {"wait_timeout_seconds": 600}}},
+    }, mcp_servers={name: {"url": url, "connect_timeout": 15, "timeout": 30} for name, url in remote.items()},
+                       sessions={"orphan_end_grace_s": ORPHAN_GRACE})
+    reviewer = dict(common, model=model(reviewer_url), sessions={"orphan_end_grace_s": ORPHAN_GRACE})
+    homes = {"default": HH, "analyst": HH / "profiles/analyst", "implementer": HH / "profiles/implementer",
+             "reviewer": HH / "profiles/reviewer"}
+    for name, cfg in (("default", default), ("analyst", analyst), ("implementer", implementer),
+                      ("reviewer", reviewer)):
         homes[name].mkdir(parents=True, exist_ok=True)
         (homes[name] / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
         (homes[name] / ".env").write_text("OPENAI_API_KEY=sk-fake-e2e\n", encoding="utf-8")
+    # The implementer hands work on itself, so it carries the plugin like the default profile.
+    (homes["implementer"] / "plugins").mkdir(exist_ok=True)
+    (homes["implementer"] / "plugins/profile-tasks").symlink_to(REPO)
     (HH / "plugins").mkdir(exist_ok=True)
     (HH / "plugins/profile-tasks").symlink_to(REPO)
     (HH / "plugins/pt-probe").symlink_to(REPO / "e2e/probe-plugin")
-    EVIDENCE["configs"] = {"default": default, "analyst": analyst, "implementer": implementer}
+    EVIDENCE["configs"] = {"default": default, "analyst": analyst, "implementer": implementer, "reviewer": reviewer}
 
 
 class _Unauthorized(BaseHTTPRequestHandler):
@@ -873,14 +906,28 @@ async def trial_timeout_status(ctx) -> None:
         await until(lambda: any("SLOW-DONE" in r[1] for r in analyst_db(
             "SELECT role, coalesce(content, '') FROM messages WHERE session_id = ?", (ack["session_id"],))),
             120, "late analyst answer stored")
+        await ask_status(ctx, mgr, sid, task_id)
+        # The observer may still get the turn's end frame after status read the answer: give it time to (not) inject.
+        await asyncio.sleep(5)
+        # Read after the settle: an injection writes the answer before it marks it delivered.
+        await until(lambda: plugin_task(task_id).get("delivered") is True, 60, "late answer delivered")
         late = await ask_status(ctx, mgr, sid, task_id)
         row = late["tasks"][0]
-        injected = [b for b in ctx["m"].main_requests() if b["messages"][-1].get("role") == "user"
+
+        def injected() -> list:
+            return [b for b in ctx["m"].main_requests() if b["messages"][-1].get("role") == "user"
                     and "SLOW-DONE" in text_of(b["messages"][-1])]
+        handed = plugin_task(task_id).get("delivered_by")
+        if handed == "injection":
+            await until(lambda: injected(), 60, "injected late answer")
+        # The observer keeps following past the limit: it hands the answer over itself, or status does; never both.
+        once = len(injected()) == (1 if handed == "injection" else 0) and handed in ("injection", "status")
         check("late", row["status"] == "answered" and "SLOW-DONE" in (row.get("answer") or "")
-              and row.get("delivered") is True and not injected,
-              "after the wait limit, status fetched the answer that arrived later and handed it to the manager",
-              status=late, analyst_session=ack["session_id"], seconds_since_start=round(time.monotonic() - t0, 1))
+              and row.get("delivered") is True and once,
+              "after the wait limit, the answer that arrived later was handed to the manager exactly once "
+              "(injection or the status result) and status shows it", status=late, delivered_by=handed,
+              injected=len(injected()), analyst_session=ack["session_id"],
+              seconds_since_start=round(time.monotonic() - t0, 1))
         again = await ask_status(ctx, mgr, sid, task_id)
         check("late", again["tasks"][0]["status"] == "answered" and "note" not in again["tasks"][0],
               "a second status keeps the answer and does not re-read the target", status=again)
@@ -928,7 +975,7 @@ async def trial_followup(ctx) -> None:
 
 
 async def trial_notice_retry(ctx) -> None:
-    """Approval notices refused by a closed manager conversation are kept and handed over on the next tool call."""
+    """Approval notices refused by a closed manager conversation are kept and handed over once it reopens."""
     async with Client("default") as mgr:
         snap = await mgr.rpc("session.create", source="gui", request_id=uuid.uuid4().hex)
         sid = snap["session_id"]
@@ -946,6 +993,7 @@ async def trial_notice_retry(ctx) -> None:
             LATE_APPROVAL_DELAY + APPROVAL_TIMEOUT + 90, "approval, its ending and the result kept")
         missed = [manager_saw(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval"),
                   manager_saw(ctx["m"], f"Task {task_id} (analyst): the approval for")]
+        reopened_at = time.time()
         await mgr.rpc("session.resume", session_id=sid, omit_messages=True)
         await call_tool(ctx, mgr, sid, {"action": "status"}, "status")
         got = await until(lambda: manager_saw(ctx["m"], f"Task {task_id} (analyst): the approval for"), 120,
@@ -953,12 +1001,14 @@ async def trial_notice_retry(ctx) -> None:
         after = await until(lambda: (lambda log: log if not log["kept"] else None)(notice_log(task_id)), 60,
                             "outbox emptied")
         check("retry", not any(missed) and all(not a["ok"] for e in kept["kept"] for a in e["attempts"])
-              and all(n["trigger"] == "tool_call" for n in after["notices"]) and not after["kept"]
+              # The tool call hands them over, or the 60 s retry when its tick falls between reopen and call.
+              and all(n["trigger"] in ("tool_call", "retry") and n["delivered_at"] >= reopened_at
+                      for n in after["notices"]) and not after["kept"]
               and [n["kind"] for n in after["notices"]] == ["approval", "approval_end", "result"]
               and "expired unanswered" in got
               and manager_saw(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval"),
               "the approval notice and its expiry, refused while the manager conversation was closed, were kept "
-              "and handed over in order at the next profile_task call",
+              "and handed over in order once the conversation reopened",
               session_close=closed, kept_before=kept, delivered_after=after, delivered_ending=got,
               seen_before_reopen=[bool(x) for x in missed],
               seen_after=bool(manager_saw(ctx["m"], f"Task {task_id} (analyst) is waiting for an approval")))
@@ -1136,9 +1186,98 @@ async def trial_bad_target(ctx) -> None:
               result=result)
 
 
+def profile_tasks_of(profile: str) -> dict:
+    """The tasks in *profile*'s own plugin state file."""
+    home = HH if profile == "default" else HH / "profiles" / profile
+    tasks: dict = {}
+    for path in (home / "plugin-data").glob("*/state.json"):
+        tasks.update(json.loads(path.read_text()).get("tasks") or {})
+    return tasks
+
+
+def first_request_with(server: FakeLLMServer, needle: str) -> int | None:
+    for i, body in enumerate(server.main_requests()):
+        if any(m.get("role") != "assistant" and needle in text_of(m) for m in body["messages"]):
+            return i
+    return None
+
+
+async def trial_follow(ctx) -> None:
+    """A task is followed to its real end: two updates while it waits on its own work, then one final answer."""
+    async with Client("default") as mgr:
+        sid = await manager_session(mgr)
+        ack = await start_task(ctx, mgr, sid, "FLOW", "follow to the end", profile="implementer")
+        task_id, asid = ack["task_id"], ack["session_id"]
+        first = await until(lambda: manager_saw(ctx["m"], f"Update from implementer for task {task_id}"), 120,
+                            "first update")
+        first_at = time.time()
+        sub = next(((k, v) for k, v in profile_tasks_of("implementer").items() if v.get("profile") == "reviewer"),
+                   (None, {}))
+        check("follow", sub[0] is not None and f"waiting on task {sub[0]} (reviewer)" in first
+              and plugin_task(task_id).get("status") == "waiting_subwork",
+              "the implementer started task B on the reviewer and ended its turn: the manager got an update naming "
+              "task B and the task is waiting_subwork", update=first[:400], subtask=sub[0])
+        turns_before = len(ctx["a"].main_requests())
+        await asyncio.sleep(max(0, first_at + 60 - time.time()))
+        quiet = plugin_task(task_id)
+        check("follow", not session_ended("implementer", asid),
+              f"past the {ORPHAN_GRACE:g} s orphan grace, the paused implementer session (no viewer but the "
+              "observer) is not closed", ended=session_ended("implementer", asid))
+        check("follow", len(ctx["a"].main_requests()) == turns_before and quiet.get("status") == "waiting_subwork"
+              and not manager_saw(ctx["m"], f"Answer from implementer for task {task_id}")
+              and len(ctx["r"].main_requests()) >= 1,
+              "60 s after the update the implementer session is still open and has no turn, the reviewer is still "
+              "working, and the manager got nothing more", implementer_requests=len(ctx["a"].main_requests()) - turns_before,
+              status=quiet.get("status"))
+        second = await until(lambda: manager_saw(ctx["m"], "waiting on CI"), 120, "second update")
+        check("follow", f"Update from implementer for task {task_id}" in second and "task " + str(sub[0]) not in
+              second.split("Not finished:", 1)[-1].split("\n", 1)[0] and "Verdict received" in second,
+              "the reviewer verdict started a turn in the implementer session; it ended with WAITING: CI and the "
+              "manager got a second update", update=second[:400])
+        taken = await call_tool(ctx, mgr, sid, {"action": "follow_up", "task_id": task_id,
+                                                "text": "SCENARIO:FLOW CI-GREEN"}, "follow_up")
+        final = await until(lambda: manager_saw(ctx["m"], f"Answer from implementer for task {task_id}"), 120,
+                            "final answer")
+        done = await until(lambda: (lambda t: t if t.get("status") == "answered" else None)(plugin_task(task_id)),
+                           30, "task answered")
+        order = [first_request_with(ctx["m"], n) for n in (
+            f"Update from implementer for task {task_id}", "waiting on CI", f"Answer from implementer for task {task_id}")]
+        outboxes = {p: [t_id for t_id, t in profile_tasks_of(p).items() if t.get("outbox")]
+                    for p in ("default", "implementer", "reviewer")}
+        rows = analyst_db_of("implementer", "SELECT role, coalesce(content, '') FROM messages")
+        # Control: task B is answered, so nothing holds its reviewer session; the orphan grace closes it.
+        reviewer_end = await until(lambda: session_ended("reviewer", sub[1].get("session_id") or ""),
+                                   ORPHAN_GRACE + 60, "reviewer session closed")
+        refused = [line for p in HH.rglob("*.log") for line in p.read_text(errors="replace").splitlines()
+                   if "is not a live local session" in line and f"local:dm:{asid} " in line]
+        check("follow", reviewer_end == "ws_orphan_reap" and not refused,
+              "once task B is answered its reviewer session is closed by the orphan grace, and no notice to the "
+              "implementer session was refused as 'not a live local session'", reviewer_end=reviewer_end, refused=refused[:3])
+        check("follow", taken.get("accepted") is True and "FLOW-FINAL" in final and "finished:" in final
+              and all(x is not None for x in order) and order == sorted(order) and len(set(order)) == 3
+              and not any(outboxes.values()) and done.get("turns") and len(done["turns"]) == 3
+              and any("Answer from reviewer" in r[1] for r in rows if r[0] == "user"),
+              "the manager got two updates then one final answer, in order; the task is answered after three turns in "
+              "one session; no notice is left in any outbox", order=order, outboxes=outboxes, turns=done.get("turns"),
+              final=final[:300], session=asid)
+
+
+def session_ended(profile: str, session_id: str) -> str | None:
+    """The end reason of a session row of *profile* (None while open)."""
+    rows = analyst_db_of(profile, "SELECT ended_at, end_reason FROM sessions WHERE id = ? OR parent_session_id = ?",
+                         (session_id, session_id))
+    return next((r[1] or "ended" for r in rows if r[0] is not None), None)
+
+
+def analyst_db_of(profile: str, sql: str, args: tuple = ()) -> list[tuple]:
+    with sqlite3.connect(f"file:{HH / 'profiles' / profile / 'state.db'}?mode=ro", uri=True) as db:
+        return db.execute(sql, args).fetchall()
+
+
 TRIALS = {"1-2-3": trial_1_2_3, "4": trial_4, "5": trial_5, "6": trial_6, "7": trial_7, "8": trial_8,
           "9": trial_9, "limit": trial_timeout_status, "targets": trial_bad_target, "restart": trial_restart,
           "followup": trial_followup, "retry": trial_notice_retry, "mcp_auth": trial_mcp_auth, "keyed": trial_keyed,
+          "follow": trial_follow,
           # Last: its 'always' relay permanently allows recursive delete in the analyst profile.
           "approval": trial_approval}
 # Trials that cannot pass in the isolated run (no desktop app): run only when named.
@@ -1148,10 +1287,10 @@ BY_NAME_ONLY = {"9"}
 async def main(selected: list[str]) -> int:
     remote, remote_handles = start_remote_mcp()
     with FakeLLMServer(manager_model) as m, FakeLLMServer(analyst_model) as a, \
-            contextlib.ExitStack() as cleanup:
+            FakeLLMServer(reviewer_model) as r, contextlib.ExitStack() as cleanup:
         cleanup.callback(stop_remote_mcp, remote_handles)
-        write_home(m.base_url, a.base_url, remote)
-        ctx = {"m": m, "a": a, "proc": start_gateway()}
+        write_home(m.base_url, a.base_url, remote, r.base_url)
+        ctx = {"m": m, "a": a, "r": r, "proc": start_gateway()}
         try:
             async with Client("default"):
                 pass

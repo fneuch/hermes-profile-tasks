@@ -37,7 +37,30 @@ profile served by the same Hermes gateway.
   the plugin at once (a gateway launcher that then attaches to the running gateway, and that gateway),
   each task is closed and noticed by one of them only: the plugin state is read and written under a
   lock file in the plugin's data folder.
-- Wait limit: 30 minutes by default. Past it the manager gets a message: no answer yet, the work
+- A task is followed to its real end. An observer per open task (its own connection to the target
+  profile's gateway, bound to the task session) reads every event of the session. Every turn that
+  ends there, whoever started it (an injection, a queued prompt, a finished background command), is
+  told to the manager. After each turn the plugin decides finished or paused; the task is paused
+  if any of four conditions holds:
+  1. a task of the target profile, started from this session (`caller_session_id`), is still
+     `starting`, `running`, `waiting_timeout` or `waiting_subwork`, or finished with its result not
+     delivered yet (read from that profile's plugin state, read-only, under its `tasks.lock`);
+  2. a prompt is queued in the live session;
+  3. a background command of the session will notify it when it ends
+     (`_session_owns_pending_process_notification`);
+  4. the last non-empty line of the turn's text starts with `WAITING:` (the target is told to write
+     it when something it started will bring it back; without it the answer is taken as final).
+  Paused: the manager gets `Update from <profile> for task <id> ... Not finished: it is waiting on
+  <reasons>` with the turn's text, the task is `waiting_subwork`, and its next turns arrive on their
+  own (no `follow_up` needed; one is accepted, and sent on the observer's connection). Finished: the
+  manager gets `Answer from <profile> ... finished:`, the task is `answered` and the observer closes.
+  A failed turn is an update saying so while something is open, else the task fails as before.
+  Conditions 2 and 3 use Hermes internals that exist only in the gateway process; if they are
+  missing, the load reports it and only conditions 1 and 4 apply.
+- Follow limit: `follow_timeout_seconds` (default 86400). A paused task with no new turn that long
+  gets a `follow_limit` notice, becomes `follow_lost` and its observer closes; the session still
+  exists, and `status` reads it (a turn that arrived later is returned as a late answer).
+- Wait limit: 30 minutes by default, for the turn the plugin submitted. Past it the manager gets a message: no answer yet, the work
   is not cancelled, check back with `status`.
 - Approvals in a task session: the plugin's connection to the target session sees its
   `approval.request` at once and injects a notice into the manager conversation (command, task,
@@ -189,6 +212,7 @@ Linux only in the e2e harness: the remote MCP fixture also dies with the harness
          allow_gateway_injection: true   # lets the plugin inject the answer into the manager session
          settings:
            wait_timeout_seconds: 1800    # optional, default 1800
+           follow_timeout_seconds: 86400 # optional, default 24 h: a paused task is no longer followed
    ```
 
 3. The gateway must serve the target profiles (`gateway.multiplex_profiles: true`, already the case
@@ -226,6 +250,10 @@ only read (code and interpreter).
   target had already ended is not reported as forwarded, two approvals open in one session each
   end on their own call, a failure after the 120 s acknowledgement wait is recorded, a new turn
   drops the earlier turn's open calls, a finished task is not reported cut off at the next load.
+- `PT_SCRIPT=tests/test_follow_real_end.py e2e/run.sh`: a task followed to its real end with a fake
+  gateway: an injected turn reaches the manager, the four-condition rule (sub-task of the session,
+  queued prompt, background command, `WAITING:` last line), failed turns, `follow_up` and approval
+  answers on the observer's connection, the follow limit, restart, the 60 s notice retry, `result(key)`.
 - `PT_SCRIPT=tests/test_status_item.py e2e/run.sh`: the status-bar item's data: `caller_session_id`
   set at `start`, moved by a `follow_up` from another conversation, none on a keyed task; each
   stored status mapped to the item's state; `GET /tasks` lists only the conversation's own tasks
