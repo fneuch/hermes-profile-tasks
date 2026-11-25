@@ -3,7 +3,8 @@
 - not sent: the update of a turn that ends paused (``Not finished ... waiting on``), the wait-limit notice
   (``no answer within N minutes``), and the wait-limit notice of an earlier turn; status still shows them;
   a refused notice queued earlier is still retried at that event;
-- still sent: the final answer, a failed turn, a failed turn while paused, an approval request, an MCP
+- still sent: the final answer, a failed turn, a failed turn while paused, a blocked turn while paused (an
+  open sub-task holds it; the same pause without ``BLOCKED:`` sends nothing), an approval request, an MCP
   re-authentication notice, a cut wait, a restart, and the follow limit of a paused session.
 
 Run: ``PT_SCRIPT=tests/test_quiet_progress.py e2e/run.sh`` (isolated HOME/HERMES_HOME, the installed Hermes
@@ -88,6 +89,8 @@ def main() -> int:
 
     ctx = FakeCtx()
     plugin = mod.ProfileTasks(ctx, [])
+    # Each check reads one task's end while earlier tasks stay open; the grouping is in test_batch_answers.py.
+    plugin.batch_seconds = 0
     mod._PLUGIN = plugin
 
     def make(task_id: str, **fields) -> None:
@@ -163,6 +166,38 @@ def main() -> int:
     check(len(new_texts(n)) == 1 and "this turn failed: tool crashed" in new_texts(n)[0]
           and plugin.store.get("t-pfail")["status"] == "waiting_subwork",
           "a failed turn of a paused task is sent", injected=new_texts(n))
+
+    # Sent: a blocked turn paused by an open sub-task (target state written as its plugin would; not WAITING:).
+    from hermes_cli.plugins_state import PluginState
+    folder = plugin._home("implementer") / "plugin-data" / PluginState("profile-tasks").data_dir.name
+    folder.mkdir(parents=True, exist_ok=True)
+    subtasks = {"sub-1": {"task_id": "sub-1", "status": "running", "caller_session_id": "s-t-blk",
+                          "profile": "reviewer"},
+                "sub-2": {"task_id": "sub-2", "status": "running", "caller_session_id": "s-t-pq",
+                          "profile": "reviewer"}}
+    (folder / "state.json").write_text(json.dumps({mod.STATE_KEY: subtasks}))
+    try:
+        make("t-blk")
+        n = len(ctx.injected)
+        turn_end("t-blk", "half done\nBLOCKED: the staging password")
+        task = plugin.store.get("t-blk")
+        check(len(new_texts(n)) == 1 and "it needs the staging password" in new_texts(n)[0]
+              and "task sub-1 (reviewer)" in new_texts(n)[0] and task["status"] == "waiting_subwork"
+              and task.get("blocked") == "the staging password" and not task.get("outbox"),
+              "a blocked turn of a paused task is sent at once", injected=new_texts(n),
+              status=task["status"], blocked=task.get("blocked"), reasons=task.get("pause_reasons"))
+
+        # Not sent: the same pause without BLOCKED:.
+        make("t-pq")
+        n = len(ctx.injected)
+        turn_end("t-pq", "half done")
+        task = plugin.store.get("t-pq")
+        check(not new_texts(n) and not task.get("outbox") and task["status"] == "waiting_subwork"
+              and task.get("pause_reasons") == ["task sub-2 (reviewer)"] and not task.get("blocked"),
+              "the same pause without BLOCKED: is not sent", injected=new_texts(n), status=task["status"],
+              reasons=task.get("pause_reasons"))
+    finally:
+        (folder / "state.json").write_text(json.dumps({mod.STATE_KEY: {}}))
 
     # Sent: an approval request.
     make("t-appr")

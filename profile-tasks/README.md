@@ -11,7 +11,8 @@ profile served by the same Hermes gateway.
   profile, only when it stands alone: whitespace or a line end on both sides, no punctuation or
   parenthesis glued to it.
 - When the target's turn ends, its final text is injected once into the calling manager
-  conversation (`ctx.inject_message`), which starts a manager turn.
+  conversation (`ctx.inject_message`), which starts a manager turn. Final answers and failures
+  are grouped per calling conversation (see Grouped answers below).
 - `follow_up`: sends a new text to the same session (same context). Refused while the task's turn
   is still running (or its state cannot be read): use `correct` for that turn, or send the
   follow-up after its answer arrives.
@@ -29,7 +30,7 @@ profile served by the same Hermes gateway.
   Progress is not sent there: a paused turn's update and the wait-limit message start no turn in
   the manager; `status`, the task session and the status-bar item show them. All the notices a task has queued go in one
   injection, in order: Hermes may queue separate injections made at once in any order. Notices of
-  different tasks are still separate injections. A refused one is retried, in order, at the start
+  different tasks are separate injections, except held answers going out together (below). A refused one is retried, in order, at the start
   of the next `profile_task` call or at the next event of its task; the gateway refuses a
   conversation that no client has open.
 - Gateway restart: when the plugin loads, it finds the tasks whose waiting process is gone, marks
@@ -52,14 +53,30 @@ profile served by the same Hermes gateway.
      (`_session_owns_pending_process_notification`);
   4. the last non-empty line of the turn's text starts with `WAITING:` (the target is told to write
      it when something it started will bring it back; without it the answer is taken as final).
+  A last non-empty line starting with `BLOCKED:` (the target is told to write it when it cannot go
+  on without a decision, an answer or an action from the caller) marks the task blocked: if
+  nothing else holds it open, the manager gets `Blocked: answer from <profile> for task <id> ...,
+  it needs <what>` at once, and the task is `answered` with `blocked` set to what it needs; a
+  paused turn with it is sent to the manager at once as an update saying so.
   Paused: the task is `waiting_subwork`, `status` shows the turn's text (`update`) and its reasons
-  (`waiting_on`), nothing is sent to the manager, and its next turns arrive on their own (no
+  (`waiting_on`), nothing is sent to the manager unless the turn failed or is blocked, and its next turns arrive on their own (no
   `follow_up` needed; one is accepted, and sent on the observer's connection). Finished: the
   manager gets `Answer from <profile> ... finished:`, the task is `answered` and the observer closes.
   A failed turn while something is open is sent to the manager as `Update from <profile> for task
   <id> ... Not finished: it is waiting on <reasons>` with the failure; else the task fails as before.
   Conditions 2 and 3 use Hermes internals that exist only in the gateway process; if they are
   missing, the load reports it and only conditions 1 and 4 apply.
+- Grouped answers: a final answer or failure (`result`, or `earlier_result` for an earlier turn
+  ending late) waits in its task's queue while any task with the same calling conversation
+  (`caller_session_key`, keyed tasks excluded) is `starting`, `running`, `waiting_timeout` or
+  `waiting_subwork`. When none is, the held notices of all those tasks go in one injection, each
+  task's notices oldest first. A task started meanwhile joins the wait. Cap: once a held notice was
+  queued 15 minutes ago (`BATCH_LIMIT_SECONDS`, 900), whatever is ready goes out at the next event
+  or 60 s retry even while other tasks run, so a conversation can get more than one message.
+  Approval requests and their end, MCP sign-in, wait cut off, update (only when the turn failed or
+  is blocked), follow-limit and restart notices, and a `BLOCKED:` answer go at once; a task queue holding one of them goes whole. An
+  answer handed over by `status` leaves the queue. The queues are in the plugin state, so held
+  answers survive a restart and follow the same rule after it.
 - Follow limit: `follow_timeout_seconds` (default 86400). A paused task with no new turn that long
   gets a `follow_limit` notice, becomes `follow_lost` and its observer closes; the session still
   exists, and `status` reads it (a turn that arrived later is returned as a late answer).
@@ -204,8 +221,8 @@ Linux only in the e2e harness: the remote MCP fixture also dies with the harness
 
    Only this folder is installed, its desktop part and backend route included. The app copies the
    desktop part when it reloads: after the install, restart the gateway and reload the app (Ctrl+R).
-   In the desktop, Skills > Plugins > Install from Git takes
-   `fneuch/hermes-profile-tasks#profile-tasks`.
+   In the desktop, Skills > Plugins > Install from Git
+   takes `fneuch/hermes-profile-tasks#profile-tasks`.
 
 2. In `~/.hermes/config.yaml`:
 
@@ -258,6 +275,14 @@ only read (code and interpreter).
   gateway: an injected turn reaches the manager, the four-condition rule (sub-task of the session,
   queued prompt, background command, `WAITING:` last line), failed turns, `follow_up` and approval
   answers on the observer's connection, the follow limit, restart, the 60 s notice retry, `result(key)`.
+- `PT_SCRIPT=tests/test_batch_answers.py e2e/run.sh`: grouped answers with a fake calling
+  conversation: answers and failures held while a task of the conversation is starting, running,
+  waiting or paused, then one injection; another conversation's task holds nothing; a task started
+  meanwhile joins the wait; the 15-minute cap (899 s held, 901 s sent alone, the slow answer a
+  second message, also by the retry loop alone); approvals, approval ends and MCP sign-in notices
+  at once; a `BLOCKED:` last line at once and recorded, `BLOCKED:` mid-text held; an answer taken
+  by status not sent again; held answers after a reload and a refused batch kept whole; the
+  `BLOCKED:` guidance.
 - `PT_SCRIPT=tests/test_status_item.py e2e/run.sh`: the status-bar item's data: `caller_session_id`
   set at `start`, moved by a `follow_up` from another conversation, none on a keyed task; each
   stored status mapped to the item's state; `GET /tasks` lists only the conversation's own tasks
@@ -266,7 +291,9 @@ only read (code and interpreter).
 - `PT_SCRIPT=tests/test_liveness.py e2e/run.sh`: the waiting-process check with `/proc` (Linux) and
   with `/proc` hidden (the macOS path): a live waiter, a reused pid, a gone pid, a zombie.
 - `PT_SCRIPT=tests/test_e2e_harness.py e2e/run.sh`: the probe plugin's response is never read half
-  written; `e2e/stop_gateway.py` reads a gateway that exits while it is read as stopped.
+  written; `e2e/stop_gateway.py` reads a gateway that exits while it is read as stopped and reaps
+  only its own home's processes; `e2e/run.sh` removes a passing run's directory, keeps a failing one
+  and removes run directories older than a day.
 - `e2e/run.sh [trial ...]`: the end-to-end trials (`1-2-3 4 5 6 7 8 9 limit targets restart followup
   retry mcp_auth keyed approval`; with no argument all but `9`, which needs the desktop app and runs
   only when named; `keyed` calls `send`/`result` from a gateway thread of the
@@ -282,7 +309,10 @@ only read (code and interpreter).
   new task that calls nothing, because Hermes' breaker is open.
 
 `e2e/run.sh` stops the isolated gateway on every exit (end, failure, Ctrl-C, TERM) through that
-home's own control socket (`e2e/stop_gateway.py HERMES_HOME`, which refuses the real `~/.hermes`).
+home's own control socket (`e2e/stop_gateway.py HERMES_HOME`, which refuses the real `~/.hermes`),
+then ends any process still running with that `HERMES_HOME`. The run's directory is removed after a
+passing run; a failing run keeps it (or any run with `PT_E2E_KEEP=1`) and run directories older
+than a day are removed at the next start; other entries under `PT_E2E_BASE` are left alone.
 
 Trial 9 (clicking the link in the desktop) is not covered: the isolated run has no desktop app.
 

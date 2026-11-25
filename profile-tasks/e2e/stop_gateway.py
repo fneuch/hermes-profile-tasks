@@ -4,6 +4,8 @@ Usage: stop_gateway.py HERMES_HOME [HERMES_HOME ...]
 Each home must sit under the e2e base (``PT_E2E_ROOT``, default ``~/.cache/profile-tasks-e2e`` of the
 real user); the real ``~/.hermes`` is refused. The gateway answers with its pid, drains and exits;
 this script waits for that pid to disappear and prints one line per home. Exit 1 if one is still alive.
+Then any process still running with that ``HERMES_HOME`` (a gateway the socket missed or that outlived
+its run) is terminated, and killed if it does not exit.
 """
 
 from __future__ import annotations
@@ -50,10 +52,42 @@ def stop(home: Path, wait: float = 90.0) -> bool:
     return gone
 
 
+def reap(home: Path, wait: float = 10.0) -> int:
+    """Terminate, then kill, every other process whose HERMES_HOME is ``home``; returns how many."""
+    import psutil
+
+    home = home.resolve()
+    left = []
+    for proc in psutil.process_iter():
+        try:
+            value = proc.environ().get("HERMES_HOME")
+        except (psutil.Error, OSError):
+            continue
+        if proc.pid != os.getpid() and value and Path(value).resolve() == home:
+            left.append(proc)
+    for proc in left:
+        try:
+            proc.terminate()
+        except psutil.NoSuchProcess:
+            pass
+    _, still = psutil.wait_procs(left, timeout=wait)
+    for proc in still:
+        try:
+            proc.kill()
+        except psutil.NoSuchProcess:
+            pass
+    if left:
+        print(f"REAPED {home}: pids={[proc.pid for proc in left]}")
+    return len(left)
+
+
 def main(argv: list[str]) -> int:
     ok = True
     for raw in argv:
         ok = stop(Path(raw)) and ok
+        home = Path(raw).resolve()
+        if ROOT in home.parents and not (home == REAL_HERMES or REAL_HERMES in home.parents):
+            reap(home)
     return 0 if ok else 1
 
 

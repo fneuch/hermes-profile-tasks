@@ -173,6 +173,8 @@ def main() -> int:
 
     ctx = FakeCtx()
     plugin = mod.ProfileTasks(ctx, [])
+    # Each check reads one task's end while earlier tasks stay open; the grouping is in test_batch_answers.py.
+    plugin.batch_seconds = 0
     mod._PLUGIN = plugin
 
     # The target profile's plugin state, read by the plugin: written here as the target's own plugin would.

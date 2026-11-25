@@ -3,6 +3,9 @@
 - the probe plugin never leaves a partly written response where the trial reads it;
 - ``stop_gateway.alive`` says not alive, without raising, for a gateway that exits while it is read;
 - two ``run.sh`` invocations started in the same second do not share a home;
+- ``run.sh`` removes its directory after a passing run, keeps it after a failing one, and removes
+  run directories (and only those) older than a day at start;
+- ``stop_gateway.reap`` ends the processes left with the run's ``HERMES_HOME`` and no other;
 - the remote MCP fixture starts off Linux (no ``prctl`` there);
 - the keyed trial does not count Hermes's background review of an earlier session as a manager turn.
 
@@ -114,8 +117,43 @@ def main() -> int:
                                  stderr=subprocess.STDOUT, text=True) for _ in range(2)]
         homes = [proc.communicate(timeout=60)[0].strip().splitlines()[-1:] for proc in runs]
         codes = [proc.returncode for proc in runs]
-    check(codes == [0, 0] and len({tuple(h) for h in homes}) == 2,
-          "two harness runs started in the same second get separate homes", homes=homes, codes=codes)
+        left = sorted(p.name for p in (box / "runs").iterdir())
+        check(codes == [0, 0] and len({tuple(h) for h in homes}) == 2,
+              "two harness runs started in the same second get separate homes", homes=homes, codes=codes)
+        check(left == [], "a passing harness run removes its directory", left=left)
+
+        # 3b. A failing run keeps its directory; a directory older than a day is removed at the next start.
+        old = box / "runs" / "20250101-000000-old000"
+        (old / "home").mkdir(parents=True)
+        os.utime(old, (time.time() - 2 * 86400,) * 2)
+        other = box / "runs" / "not-a-run"
+        other.mkdir()
+        os.utime(other, (time.time() - 2 * 86400,) * 2)
+        script.write_text("raise SystemExit(3)\n")
+        failed = subprocess.run(["bash", str(E2E / "run.sh")], env=env, capture_output=True, text=True, timeout=60)
+        left = sorted(p.name for p in (box / "runs").iterdir())
+        kept = [name for name in left if name != other.name]
+        check(failed.returncode == 3 and len(kept) == 1 and kept[0] != old.name and other.name in left
+              and "e2e: kept" in failed.stderr,
+              "a failing run keeps its directory, an old run is removed at start, an old non-run is kept",
+              code=failed.returncode, left=left, stderr=failed.stderr[-300:])
+
+    # 3c. reap ends the processes left with the run's HERMES_HOME, and leaves another home's alone.
+    with tempfile.TemporaryDirectory() as box_dir:
+        box = Path(box_dir)
+        mine, other = box / "mine" / ".hermes", box / "other" / ".hermes"
+        hold = [sys.executable, "-c", "import time\nwhile True: time.sleep(1)"]
+        procs = [subprocess.Popen(hold, env={**os.environ, "HERMES_HOME": str(home)}) for home in (mine, mine, other)]
+        try:
+            count = stop.reap(mine, wait=5.0)
+            time.sleep(0.2)
+            states = [proc.poll() is not None for proc in procs]
+        finally:
+            for proc in procs:
+                proc.kill()
+                proc.wait()
+    check(count == 2 and states == [True, True, False],
+          "reap ends the processes of its home only", count=count, exited=states)
 
     # 4. The remote MCP fixture's preexec hook off Linux (macOS has no libc.so.6 and no prctl), and on Linux.
     import ctypes

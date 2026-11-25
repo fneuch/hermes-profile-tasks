@@ -2,7 +2,7 @@
 
 - two follow_ups racing on one task start one turn only;
 - a follow_up clears the previous turn's answer and error, keyed or not;
-- an earlier turn's worker that ends late does not overwrite the newer turn's state;
+- an earlier turn's worker that ends late does not overwrite the newer turn's state, its answer held as a notice;
 - an approval cut off by the end of its turn says the command outcome is unknown;
 - an approval answer is marked forwarded only once the target took it, and a failed forward keeps the
   outcome notice;
@@ -154,8 +154,10 @@ def main() -> int:
                     turn=old_turn)
     task = plugin.store.get("late")
     check(new_turn != old_turn and task.get("status") == "running" and task.get("last_answer") is None
-          and task.get("turn_token") == new_turn and any("OLD" in t for t, _ in ctx.injected[before:]),
-          "a late answer of the earlier turn leaves the newer turn's state and is still sent as a notice",
+          and task.get("turn_token") == new_turn and not any("OLD" in t for t, _ in ctx.injected[before:])
+          and [e["kind"] for e in task.get("outbox") or []] == ["earlier_result"] and "OLD" in task["outbox"][0]["text"],
+          "a late answer of the earlier turn leaves the newer turn's state and is still queued as a notice, held "
+          "while the newer turn runs",
           task={k: task.get(k) for k in ("status", "last_answer", "turn_token")}, new_turn=new_turn)
     plugin._deliver("late", "Answer from analyst for task late: NEW", status="answered", last_answer="NEW",
                     turn=new_turn)

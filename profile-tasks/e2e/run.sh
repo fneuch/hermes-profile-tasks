@@ -2,7 +2,8 @@
 # Runs the end-to-end trials against an isolated Hermes home: fake HOME, own gateway, fake LLM providers.
 # Usage: e2e/run.sh [scenario ...]   (default: all); PT_SCRIPT=tests/test_load_check.py runs that script instead.
 # On every exit (success, failure, Ctrl-C, TERM from timeout) any gateway of the isolated home is stopped
-# through its own control socket.
+# through its own control socket, then the run's directory is removed unless the run failed or PT_E2E_KEEP=1.
+# Run directories older than a day under the e2e base (kept failures) are removed at start.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 AGENT="${HERMES_AGENT_DIR:-$HOME/.hermes/hermes-agent}"
@@ -10,6 +11,9 @@ AGENT="${HERMES_AGENT_DIR:-$HOME/.hermes/hermes-agent}"
 PY="${HERMES_PYTHON:-$(python3 -c 'import json,glob,sys; f=sorted(glob.glob(sys.argv[1]+"/installs/*/facts.json"))[0]; print(json.load(open(f))["packages"]["venv"]["environment"]+"/bin/python")' "$HOME/.hermes")}"
 ROOT="${PT_E2E_BASE:-$HOME/.cache/profile-tasks-e2e}"
 mkdir -p "$ROOT"
+# Only directories named like a run (see BASE below), so a shared PT_E2E_BASE keeps everything else.
+find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-??????' \
+  -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
 # Its own directory per invocation, even for two started in the same second.
 BASE="$(mktemp -d "$ROOT/$(date +%Y%m%d-%H%M%S)-XXXXXX")"
 mkdir -p "$BASE/home" "$BASE/run"
@@ -36,6 +40,11 @@ cleanup() {
   fi
   if [ -d "$BASE/home/.hermes" ]; then
     isolated "$REPO/e2e/stop_gateway.py" "$BASE/home/.hermes" || status=1
+  fi
+  if [ "$status" -eq 0 ] && [ -z "${PT_E2E_KEEP:-}" ]; then
+    rm -rf "$BASE"
+  else
+    echo "e2e: kept $BASE" >&2
   fi
   exit "$status"
 }

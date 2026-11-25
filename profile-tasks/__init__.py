@@ -76,13 +76,20 @@ LIVE_SESSION_INTERNALS = ("tui_gateway.session_notifications", "tui_gateway.serv
 STOP_INTERNALS = ("gateway.run_api",)
 # Notices kept on a keyed task (newest last); its follow-up clears them.
 KEYED_NOTICE_LIMIT = 20
+# Notice kinds held until the calling conversation has no open task: a turn's final answer or failure.
+HELD_KINDS = ("result", "earlier_result")
+# A held notice goes out this long after it was queued, even while other tasks of its conversation are open.
+BATCH_LIMIT_SECONDS = 900
 
 TARGET_GUIDANCE = (
     "Nobody watches this session live and nobody can answer a clarify question here. "
     "If you need information, ask for it in your final answer. "
     "If you end a turn while something you started will bring you back to this session (a task given to "
     "another profile, a background command, a card, a CI run), end your message with a last line "
-    "`WAITING: <what>`. Without it, your answer is taken as final."
+    "`WAITING: <what>`. Without it, your answer is taken as final. "
+    "If you cannot go on without a decision, an answer or an action from whoever gave you this task, end your "
+    "message with a last line `BLOCKED: <what you need>`: it reaches them at once, while a final answer may wait "
+    "for their other tasks."
 )
 
 
@@ -597,9 +604,36 @@ def _label(task_id: str, task: dict) -> str:
     return f"Task {task_id} ({task.get('profile')})"
 
 
-def _notice(message: str, kind: str) -> dict:
-    """One outbox entry for the calling conversation."""
-    return {"id": uuid.uuid4().hex[:8], "kind": kind, "text": message, "queued_at": time.time(), "attempts": []}
+def _notice(message: str, kind: str, now: bool = False) -> dict:
+    """One outbox entry for the calling conversation; *now* sends a held kind without waiting (a blocked task)."""
+    entry = {"id": uuid.uuid4().hex[:8], "kind": kind, "text": message, "queued_at": time.time(), "attempts": []}
+    return entry | ({"now": True} if now else {})
+
+
+def _held(entry: dict) -> bool:
+    """Whether *entry* waits for the other tasks of its calling conversation."""
+    return entry.get("kind") in HELD_KINDS and not entry.get("now")
+
+
+def _outbox_before_turn(task: dict, keyed: bool) -> list[dict]:
+    """The task's queue as a follow_up starts a new turn: a queued answer becomes the earlier turn's, and each
+    notice keeps the conversation it was queued for (the follow_up may come from another one)."""
+    caller = None if keyed else task.get("caller_session_key")
+    return [e | ({"kind": "earlier_result"} if e["kind"] == "result" else {})
+            | ({"to": e.get("to") or caller} if caller else {}) for e in task.get("outbox") or []]
+
+
+def _destination(entry: dict, task: dict) -> str | None:
+    """The conversation *entry* goes to: the one it was queued for, else the task's calling conversation."""
+    return entry.get("to") or task.get("caller_session_key")
+
+
+def _blocked_need(text: str) -> str | None:
+    """What the target says it needs when the last non-empty line of *text* starts with ``BLOCKED:``, else None."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines and lines[-1].startswith("BLOCKED:"):
+        return lines[-1][len("BLOCKED:"):].strip() or "a decision"
+    return None
 
 
 def _keyed_notices(current: list, new: list, trigger: str) -> list:
@@ -726,6 +760,7 @@ class ProfileTasks:
         # Set by register() when the queued-turn and background-command internals are missing.
         self.soft_missing: list[str] = []
         self.retry_seconds = OUTBOX_RETRY_SECONDS
+        self.batch_seconds = BATCH_LIMIT_SECONDS
         self._retry_thread: threading.Thread | None = None
 
     def _gateway_host(self) -> bool:
@@ -910,15 +945,15 @@ class ProfileTasks:
                     f"send the follow_up after its answer arrives.")
             # The previous turn's answer, error and admission must not pass for this turn's in status or result().
             fields = {"status": "starting", "last_answer": None, "last_update": None, "error": None,
-                      "admission_id": None,
+                      "admission_id": None, "blocked": None,
                       "waiter": _process_token(os.getpid()), "turn_token": uuid.uuid4().hex}
             if not keyed:
                 bound = bound_session_key()
                 fields["caller_session_key"] = bound or task["caller_session_key"]
                 # Without a bound key the session id could come from another conversation's os.environ.
                 fields["caller_session_id"] = (bound and _caller_session_id()) or task.get("caller_session_id")
-            with self._turn_lock:
-                self.store.update(task_id, **fields)
+            with self._turn_lock, self._outbox_lock:
+                self.store.modify(task_id, lambda current: {**fields, "outbox": _outbox_before_turn(current, keyed)})
         return self._send(task_id, text, create=False)
 
     def _read_turn(self, task: dict) -> dict | None:
@@ -1179,6 +1214,7 @@ class ProfileTasks:
             cause = payload.get("error") or payload.get("failure_reason") or status
             failure = f"{cause}" + (f"\n\nPartial answer:\n{text}" if text and text != cause else "")
         reasons = self._pause_reasons(task, text)
+        need = None if failure else _blocked_need(text)
         profile, session_id = task.get("profile"), task.get("session_id")
         if reasons:
             what = ", ".join(reasons)
@@ -1187,22 +1223,30 @@ class ProfileTasks:
                     f"follow_up.")
             if task.get("key"):
                 lead = f"Update from {profile} for {_label(task_id, task)}. Not finished: it is waiting on {what}."
+            if need:
+                lead += f" It is also blocked: it needs {need}."
             body = f"this turn failed: {failure}" if failure else text
             observer.deadline = time.monotonic() + self._follow_seconds()
-            # Progress only, unless the turn failed: status, the session and the status bar show it.
-            self._deliver(task_id, f"{lead}\n\n{body}", status="waiting_subwork", kind="update", tell=bool(failure),
+            # Progress only, unless the turn failed or is blocked: status, the session and the status bar show it.
+            self._deliver(task_id, f"{lead}\n\n{body}", status="waiting_subwork", kind="update",
+                          tell=bool(failure or need),
                           last_update=text, pause_reasons=reasons, paused_at=time.time(), last_answer=None,
-                          error=failure or None)
+                          error=failure or None, blocked=need)
             return
         observer.deadline = None
         if failure:
             message = (f"Task {task_id} ({profile}) did not complete: {failure}\n"
                        f"The {profile} session {session_id} still exists.")
-            self._deliver(task_id, message, status="failed", error=failure, pause_reasons=None)
+            self._deliver(task_id, message, status="failed", error=failure, pause_reasons=None, blocked=None)
+        elif need:
+            message = (f"Blocked: answer from {profile} for task {task_id} (session {session_id}), it needs "
+                       f"{need}:\n\n{text}")
+            self._deliver(task_id, message, status="answered", now=True, last_answer=text, last_update=None,
+                          pause_reasons=None, error=None, blocked=need)
         else:
             message = f"Answer from {profile} for task {task_id} (session {session_id}), finished:\n\n{text}"
             self._deliver(task_id, message, status="answered", last_answer=text, last_update=None,
-                          pause_reasons=None, error=None)
+                          pause_reasons=None, error=None, blocked=None)
         observer.stop()
 
     def _pause_reasons(self, task: dict, text: str) -> list[str]:
@@ -1686,8 +1730,9 @@ class ProfileTasks:
         return box.get("value", {"ok": False, "error": "timed out"})
 
     # notices to the calling conversation: kept in the task until that conversation takes them
-    def _notify(self, task_id: str, message: str, kind: str, trigger: str = "event", *, tell: bool = True) -> bool:
-        """Queue *message* for the task's calling conversation and try to hand over the queue in order.
+    def _notify(self, task_id: str, message: str, kind: str, trigger: str = "event", now: bool = False, *,
+                tell: bool = True) -> bool:
+        """Queue *message* for the task's calling conversation and try to hand over what may go now (_flush_task).
 
         With *tell* False the calling conversation gets nothing (progress only: status and the session show it).
         """
@@ -1702,16 +1747,39 @@ class ProfileTasks:
             logger.info("profile-tasks: task %s: %s notice not sent to the calling conversation", task_id, kind)
             # The event still retries notices queued earlier and refused.
             return self._flush_task(task_id, trigger)
-        self._queue_only(task_id, message, kind)
+        self._queue_only(task_id, message, kind, now)
         return self._flush_task(task_id, trigger)
 
     def _flush_outbox(self, trigger: str) -> None:
+        callers: set = set()
         for task_id, task in self.store.all().items():
-            if task.get("outbox"):
+            if not task.get("outbox"):
+                continue
+            if task.get("key"):
                 self._flush_task(task_id, trigger)
+                continue
+            dests = {_destination(e, task) for e in task["outbox"]}
+            if dests <= callers:
+                # Its conversations' queues were just handed over with another task's.
+                continue
+            callers |= dests
+            self._flush_task(task_id, trigger)
+
+    def _sendable(self, tasks: dict[str, dict]) -> dict[str, list[dict]]:
+        """The queued notices of one conversation's *tasks* that may go now, by task id.
+
+        A task's queue goes whole, to keep its order, when it holds a notice that is not held; the held ones go
+        once none of the tasks is open, or once one of them was queued batch_seconds ago.
+        """
+        queued = [e for t in tasks.values() for e in t.get("outbox") or [] if _held(e)]
+        release = (not any(t.get("status") in OPEN_SUBTASK_STATES for t in tasks.values())
+                   or any(time.time() - (e.get("queued_at") or 0) >= self.batch_seconds for e in queued))
+        return {tid: [dict(e) for e in t["outbox"]] for tid, t in tasks.items()
+                if t.get("outbox") and (release or not all(_held(e) for e in t["outbox"]))}
 
     def _flush_task(self, task_id: str, trigger: str) -> bool:
-        """Inject the task's queued notices oldest first; stop at the first refusal. True when none is left."""
+        """Inject what may go now (_sendable) of the queues of each conversation the task's notices go to, one
+        injection per conversation (_flush_conversation). True when the task has none left."""
         with self._outbox_lock:
             task = self.store.get(task_id) or {}
             if task.get("key"):
@@ -1719,38 +1787,62 @@ class ProfileTasks:
                 return not self.store.modify(task_id, lambda current: {
                     "outbox": [], "notices": _keyed_notices(current.get("notices") or [], current.get("outbox") or [],
                                                             trigger)})["outbox"]
-            outbox = [dict(e) for e in task.get("outbox") or []]
-            if not outbox:
-                return True
-            # One injection for the whole queue: Hermes may queue separate injections made at once in any order.
-            try:
-                ok = bool(self.ctx.inject_message("\n\n".join(e["text"] for e in outbox),
-                                                  session_key=task.get("caller_session_key")))
-            except Exception:  # noqa: BLE001 - a raising injection counts as a refusal
-                logger.warning("profile-tasks: injection for task %s raised", task_id, exc_info=True)
-                ok = False
-            attempt = {"at": time.time(), "trigger": trigger, "ok": ok}
-            for entry in outbox:
+            dests = {_destination(e, task) for e in task.get("outbox") or []}
+            for caller in sorted(dests, key=str):
+                self._flush_conversation(task_id, caller, trigger)
+            return not (self.store.get(task_id) or {}).get("outbox")
+
+    def _flush_conversation(self, task_id: str, caller: str | None, trigger: str) -> None:
+        """Inject in one message what may go now of the notices queued for *caller*, oldest task first."""
+        if caller:
+            # A task now bound to another conversation keeps sending what was queued for this one; only the
+            # tasks still bound to it hold its answers.
+            tasks = {}
+            for tid, t in self.store.all().items():
+                mine = t.get("caller_session_key") == caller
+                entries = [e for e in t.get("outbox") or [] if _destination(e, t) == caller]
+                if not t.get("key") and (entries or mine):
+                    tasks[tid] = {"status": t.get("status") if mine else None, "outbox": entries}
+        else:
+            task = self.store.get(task_id) or {}
+            tasks = {task_id: task | {"outbox": [e for e in task.get("outbox") or [] if not _destination(e, task)]}}
+        picked = self._sendable(tasks)
+        if not picked:
+            if tasks.get(task_id, {}).get("outbox"):
+                logger.info("profile-tasks: task %s: its answer waits for the other tasks of its conversation", task_id)
+            return
+        # One injection for all of it: Hermes may queue separate injections made at once in any order.
+        order = sorted(picked, key=lambda tid: picked[tid][0].get("queued_at") or 0)
+        outbox = [e for tid in order for e in picked[tid]]
+        try:
+            ok = bool(self.ctx.inject_message("\n\n".join(e["text"] for e in outbox), session_key=caller))
+        except Exception:  # noqa: BLE001 - a raising injection counts as a refusal
+            logger.warning("profile-tasks: injection for task %s raised", task_id, exc_info=True)
+            ok = False
+        attempt = {"at": time.time(), "trigger": trigger, "ok": ok}
+        if not ok:
+            logger.warning("profile-tasks: the calling conversation refused %d notice(s) of task(s) %s (%s); kept "
+                           "for the next try", len(outbox), ", ".join(order), ", ".join(e["kind"] for e in outbox))
+        for tid in order:
+            entries = picked[tid]
+            for entry in entries:
                 entry["attempts"] = list(entry["attempts"]) + [attempt]
             sent: list[dict] = []
             fields: dict = {}
             if ok:
                 sent = [{k: e[k] for k in ("id", "kind", "queued_at", "attempts")}
-                        | {"delivered_at": attempt["at"], "trigger": trigger} for e in outbox]
-                if any(e["kind"] == "result" for e in outbox):
+                        | {"delivered_at": attempt["at"], "trigger": trigger} for e in entries]
+                if any(e["kind"] == "result" for e in entries):
                     fields.update(delivered=True, delivered_by="injection")
-            else:
-                logger.warning("profile-tasks: the calling conversation refused %d notice(s) of task %s (%s); kept "
-                               "for the next try", len(outbox), task_id, ", ".join(e["kind"] for e in outbox))
-            tried = {e["id"]: e for e in outbox}
+            tried = {e["id"]: e for e in entries}
             delivered = {e["id"] for e in sent}
 
             # Merged into the stored outbox: another process may have queued a notice during the injection.
-            def merge(current: dict) -> dict:
+            def merge(current: dict, tried=tried, delivered=delivered, sent=sent, fields=fields) -> dict:
                 left = [tried.get(e["id"], e) for e in current.get("outbox") or [] if e["id"] not in delivered]
                 return {"outbox": left, "notices": list(current.get("notices") or []) + sent, **fields}
 
-            return not self.store.modify(task_id, merge)["outbox"]
+            self.store.modify(tid, merge)
 
     def _answer_taken_by_status(self, task_id: str, turn: str | None) -> bool:
         """Drop the queued result and mark an ended task delivered by status, in one write; True when marked.
@@ -1779,10 +1871,11 @@ class ProfileTasks:
             self.store.modify(task_id, lambda t: {"outbox": [e for e in t.get("outbox") or [] if e["kind"] != kind]})
 
     def _deliver(self, task_id: str, message: str, *, status: str, kind: str = "result", turn: str | None = None,
-                 tell: bool = True, **fields: Any) -> None:
+                 tell: bool = True, now: bool = False, **fields: Any) -> None:
         """Record *status* and *fields* and send *message*; with *turn*, only while that turn still owns the task.
 
         *tell* False records without sending *message* to the calling conversation (see _notify).
+        A final answer waits for the conversation's other tasks (_sendable) unless *now* (a blocked task).
         """
         new = {"status": status, **({"delivered": False} if kind == "result" else {}), **fields}
         final = status in ("answered", "failed")
@@ -1792,7 +1885,7 @@ class ProfileTasks:
         told = {}
         # The end and its queued notice are one write: status then finds the notice to take, never an empty outbox.
         queued = final and kind == "result" and not (self.store.get(task_id) or {}).get("key")
-        entry = _notice(message, kind)
+        entry = _notice(message, kind, now)
 
         def change(task: dict) -> dict | None:
             if final and task.get("status") in ("answered", "failed") and task.get("delivered_by") == "status":
@@ -1815,7 +1908,7 @@ class ProfileTasks:
             logger.info("profile-tasks: task %s: a newer turn owns the task; its earlier %s is sent as a notice only",
                         task_id, kind)
             kind = f"earlier_{kind}"
-        self._notify(task_id, message, kind, tell=tell)
+        self._notify(task_id, message, kind, now=now, tell=tell)
 
     def _drop_dead_approval(self, task_id: str, cause: str) -> str:
         """Clear an approval nobody can watch any more; return a sentence for the notice, or ''."""
@@ -1922,9 +2015,9 @@ class ProfileTasks:
         fields["outbox"] = list(task.get("outbox") or []) + [_notice("".join(parts), "restart")]
         return fields
 
-    def _queue_only(self, task_id: str, message: str, kind: str) -> None:
+    def _queue_only(self, task_id: str, message: str, kind: str, now: bool = False) -> None:
         with self._outbox_lock:
-            entry = _notice(message, kind)
+            entry = _notice(message, kind, now)
             self.store.modify(task_id, lambda task: {"outbox": list(task.get("outbox") or []) + [entry]})
 
     def _flush_when_hosted(self) -> None:
@@ -2199,7 +2292,10 @@ SCHEMA = {
         "Hand a task to another Hermes profile (for example analyst, implementer, reviewer) served by this "
         "gateway. The task runs in its own session under that profile, with its own tools, MCP servers and "
         "tokens. action=start returns at once with a task id and the session; the final answer arrives later "
-        "in this conversation as a new message, so end your turn after starting. action=follow_up sends a "
+        "in this conversation as a new message, so end your turn after starting. The final answers of the tasks "
+        "started from one conversation arrive together, once none of them is still open (at the latest 15 minutes "
+        "after the first is ready); approvals, MCP sign-in notices and a task that ends with a last line "
+        "`BLOCKED: <what it needs>` arrive at once. action=follow_up sends a "
         "new message in the same task session once its turn has ended (refused while it runs). A task is followed "
         "to its real end: while it waits on its own work or runs past the wait limit nothing arrives here "
         "(action=status shows its progress), and the last message says finished. Failures, approvals and "
