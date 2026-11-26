@@ -1,0 +1,75 @@
+name: usage-governor
+version: 0.1.0
+manifest_version: 2
+description: >-
+  Usage governor. Every minute a Hermes cron job with no model reads the
+  Claude plan usage (hermes usage --json) and sets the agents' mode (quiet,
+  budget, essential, reduced, full) in a state file, with a usage journal, a
+  manual override that expires on its own, a daily usage review and a health
+  check. Its pre_tool_call hook, in each profile that loads it, blocks task
+  starts and disallowed delegation options by mode.
+author: Sylvain Deschenes
+requires_hermes: '>=0.23.2'
+tags:
+  - usage
+  - cron
+  - quota
+provides_tools: []
+provides_hooks:
+  - pre_tool_call
+requires_env: []
+config_schema:
+  timezone:
+    type: string
+    default: America/Toronto
+    description: >-
+      The IANA time zone of the quiet hours, the daily review and the working
+      days.
+  quiet_hours:
+    type: list
+    default:
+      - '02:50'
+      - '08:00'
+    description: >-
+      Start and end (HH:MM, local) of the quiet hours, where the mode is quiet;
+      the working day starts at their end. An empty list = no quiet hours.
+  daily_review:
+    type: string
+    default: '16:55'
+    description: >-
+      Local time (HH:MM) of the daily usage review line, on working days. Empty
+      = no review.
+  daily_percent_of_week:
+    type: number
+    default: 20
+    description: >-
+      The smallest share of the weekly limit (in %) one working day may use;
+      a larger share when earlier days left room.
+  reduced_at:
+    type: number
+    default: 50
+    description: Usage (%) of the 5-hour window or the week from which the mode is reduced.
+  essential_at:
+    type: number
+    default: 75
+    description: Usage (%) of the 5-hour window or the week from which the mode is essential.
+  schedule:
+    type: bool
+    default: true
+    description: >-
+      When true, loading the plugin under the default profile creates the
+      usage-governor cron job (every minute) if it is missing.
+  enforce:
+    type: bool
+    default: true
+    description: >-
+      When true, the pre_tool_call hook blocks profile_task starts and
+      delegation options the mode does not allow; false = it blocks nothing.
+  reduced_options:
+    type: list
+    default:
+      - Fast
+      - Balance
+    description: >-
+      The delegation options allowed in reduced, essential, budget and quiet
+      modes; a call naming another option, or none, is blocked.

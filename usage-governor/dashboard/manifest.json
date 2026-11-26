@@ -1,0 +1,9 @@
+{
+  "name": "usage-governor",
+  "label": "Usage governor",
+  "description": "Read-only governor state and health, for the desktop status-bar item",
+  "icon": "Activity",
+  "version": "0.1.0",
+  "tab": { "path": "/usage-governor", "hidden": true },
+  "api": "plugin_api.py"
+}

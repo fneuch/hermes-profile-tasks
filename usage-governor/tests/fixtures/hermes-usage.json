@@ -1,0 +1,29 @@
+{
+  "provider": "claude-subscription-directsdk-experimental",
+  "source": "claude_code_get_usage",
+  "title": "Claude plan limits",
+  "plan": null,
+  "fetched_at": "2026-11-25T15:31:20.020033+00:00",
+  "windows": [
+    {
+      "label": "Current session",
+      "used_percent": 30.0,
+      "resets_at": "2026-11-25T17:30:00.129513+00:00",
+      "detail": null
+    },
+    {
+      "label": "Current week",
+      "used_percent": 95.0,
+      "resets_at": "2026-11-29T09:59:59.129533+00:00",
+      "detail": null
+    },
+    {
+      "label": "Fable week",
+      "used_percent": 5.0,
+      "resets_at": "2026-11-29T10:00:00.129697+00:00",
+      "detail": null
+    }
+  ],
+  "details": [],
+  "unavailable_reason": null
+}
