@@ -1,7 +1,8 @@
 """usage-governor: its pre_tool_call hook in every profile; under the default profile, its every-minute cron job.
 
 register() registers enforce.check as a pre_tool_call hook in any profile. Under the default profile it also writes ~/.hermes/scripts/usage-governor-tick.py (a thin wrapper running this plugin's tick.py) and
-creates the no-model cron job `usage-governor` through Hermes' own cron API when no job of that name exists.
+creates the no-model cron job `usage-governor` through Hermes' own cron API when no job of that name exists
+(a job still on the old `every 1m` schedule is moved to JOB_SCHEDULE).
 Under any other profile, or with the `schedule` setting false, it installs no job.
 """
 
@@ -20,11 +21,17 @@ logger = logging.getLogger(__name__)
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 JOB_NAME = "usage-governor"
-JOB_SCHEDULE = "every 1m"
+# A cron expression, not `every 1m`: Hermes computes an interval job's next run from the end of the run
+# (cron/jobs.py mark_job_run -> _advance_after_run -> compute_next_run), a few seconds after the ticker's
+# 60 s wake, so `every 1m` is due only at every other wake. A cron job's next run is the next whole minute.
+JOB_SCHEDULE = "* * * * *"
+# Schedules this plugin created before; a job still on one of them is moved to JOB_SCHEDULE.
+OLD_SCHEDULES = ("every 1m",)
 WRAPPER_NAME = "usage-governor-tick.py"
 HOOK = "pre_tool_call"
 # The cronjob() parameters the job creation and lookup pass.
-CRON_PARAMS = ("action", "name", "schedule", "no_agent", "script", "deliver", "failure_deliver", "include_disabled")
+CRON_PARAMS = ("action", "job_id", "name", "schedule", "no_agent", "script", "deliver", "failure_deliver",
+               "include_disabled")
 WRAPPER = '''#!/usr/bin/env python3
 """Written by the usage-governor plugin at each load: runs its tick.py; exits silently when it is gone."""
 import os
@@ -121,12 +128,19 @@ def _locked(path: Path):
 
 
 def ensure_job(api: Callable[..., dict]) -> str:
-    """Create the cron job unless a job named usage-governor exists (paused included): `created` or `exists`."""
+    """Create the cron job unless a job named usage-governor exists (paused included): `created`, `updated`
+    (its schedule was one of OLD_SCHEDULES, now JOB_SCHEDULE; paused stays paused) or `exists`."""
     listed = api(action="list", include_disabled=True)
     if not listed.get("success"):
         raise RuntimeError(f"cron list failed: {listed.get('error')}")
-    if any(job.get("name") == JOB_NAME for job in listed.get("jobs") or []):
-        return "exists"
+    found = [job for job in listed.get("jobs") or [] if job.get("name") == JOB_NAME]
+    if found:
+        old = [job for job in found if job.get("schedule") in OLD_SCHEDULES]
+        for job in old:
+            updated = api(action="update", job_id=job.get("job_id"), schedule=JOB_SCHEDULE)
+            if not updated.get("success"):
+                raise RuntimeError(f"cron update failed: {updated.get('error')}")
+        return "updated" if old else "exists"
     created = api(action="create", name=JOB_NAME, schedule=JOB_SCHEDULE, no_agent=True, script=WRAPPER_NAME,
                   deliver="local", failure_deliver="local")
     if not created.get("success"):
@@ -135,7 +149,7 @@ def ensure_job(api: Callable[..., dict]) -> str:
 
 
 def install(home: Path, data: Path, plugin_dir: Path = PLUGIN_DIR, api: Callable[..., dict] = cron_api) -> str:
-    """Wrapper in `<home>/scripts`, then the job: `created` or `exists`."""
+    """Wrapper in `<home>/scripts`, then the job: `created`, `updated` or `exists`."""
     write_wrapper(Path(home) / "scripts", plugin_dir)
     with _locked(Path(data) / "install.lock"):
         return ensure_job(api)
@@ -196,7 +210,7 @@ def register(ctx: Any) -> None:
     except Exception:  # noqa: BLE001 - a failed install must not break the plugin load
         logger.exception("usage-governor: installing the cron job failed")
         return
-    if result == "created":
-        logger.info("usage-governor: created the cron job %s (%s)", JOB_NAME, JOB_SCHEDULE)
+    if result in ("created", "updated"):
+        logger.info("usage-governor: %s the cron job %s (%s)", result, JOB_NAME, JOB_SCHEDULE)
     else:
         logger.debug("usage-governor: the cron job %s already exists", JOB_NAME)

@@ -138,6 +138,11 @@ class StatusItemRenderTest(unittest.TestCase):
         self.assertFalse(got["warn"])
         self.assertIn("Override active until Wed 14:00", got["tip"].split("\n"))
 
+    def test_override_with_unknown_end(self):
+        s = state("essential", 80.0, 96.0, override={"active": True, "until": None, "ignored": None})
+        got = self.render({"body": {"state": s, "health": {"ok": True, "reasons": []}}})
+        self.assertIn("Override active (end time unknown)", got["tip"].split("\n"))
+
     def test_missing_5h(self):
         s = state("reduced", None, 55.0, reading="missing", source_ok=False, reason="hermes usage exited 1: x")
         got = self.render({"body": {"state": s, "health": {"ok": True, "reasons": []}}})

@@ -200,8 +200,9 @@ def read_usage(now: Optional[float] = None, run: Callable[..., Any] = subprocess
 # --- rules (the upstream governor.py) ---
 
 def live(pct: Any, reset: Optional[float], now: float) -> Any:
-    """The window's % or None when its reset time is past or unknown (upstream: `resets_at` missing counts as 0)."""
-    return None if pct is None or (reset or 0) < now else pct
+    """The window's % or None when its reset time is past. An unknown reset keeps the %: the thresholds need only
+    the %, and `hermes usage` can give `Current session` a % with no reset time (seen: 0 %, `resets_at` null)."""
+    return None if pct is None or (reset is not None and reset < now) else pct
 
 
 def usable_reset(reset: Any, tz: ZoneInfo) -> Optional[float]:
@@ -297,7 +298,8 @@ def until_for(t: datetime, mode: str, override_until: Any, five: Any, week: Any,
     Active override: its until (None when out of range). quiet: the end of the quiet hours. budget: the
     next day's start. essential/reduced: the LATEST end among what holds the mode (each window at or above
     the threshold ends at its reset; the day budget ends at the next day's start), since the mode drops
-    only when all of them have; none known: the next day's start.
+    only when all of them have; a holding window with no usable reset time: None (no time is known);
+    nothing holds: the next day's start.
     """
     if isinstance(override_until, (int, float)) and not isinstance(override_until, bool):
         return _local(override_until, s.tz)
@@ -313,7 +315,9 @@ def until_for(t: datetime, mode: str, override_until: Any, five: Any, week: Any,
     for key, pct in (("five_hour", five), ("seven_day", week)):
         reset = resets.get(key)
         end = _local(reset, s.tz) if isinstance(reset, (int, float)) and reset > t.timestamp() else None
-        if pct is not None and pct >= threshold and end is not None:
+        if pct is not None and pct >= threshold:
+            if end is None:
+                return None  # this window holds the mode and its end is unknown: any time quoted could be too early
             ends.append(end)
     if used_today is not None and used_today >= budget * share:
         ends.append(day_start)

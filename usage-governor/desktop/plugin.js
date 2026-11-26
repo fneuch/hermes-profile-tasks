@@ -36,7 +36,7 @@ function view(body, error) {
   tip.push(`5-hour window: ${pct(state && state.five_hour)}${resets.five_hour ? `, resets ${resets.five_hour}` : ''}`)
   tip.push(`Week: ${pct(state && state.seven_day)}${resets.seven_day ? `, resets ${resets.seven_day}` : ''}`)
   const ov = state && state.override
-  if (ov && ov.active && typeof ov.until === 'number') tip.push(`Override active until ${when(ov.until)}`)
+  if (ov && ov.active) tip.push(typeof ov.until === 'number' ? `Override active until ${when(ov.until)}` : 'Override active (end time unknown)')
   if (state && state.reason) tip.push(`Reading: ${state.reason}`)
   if (state && state.settings_error) tip.push(`Settings: ${state.settings_error}`)
   // A missing reading or a settings error leaves the % frozen: warn so the number is not taken as current.

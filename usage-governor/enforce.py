@@ -121,7 +121,8 @@ def refusal(name: str, args: dict, mode: str, allowed: tuple[str, ...]) -> Optio
 
 
 def back_at(state: Mapping, now: float) -> Optional[str]:
-    """The tick's `until_local`, or None when the state has none (older tick, full) or its `until` is past."""
+    """The tick's `until_local`, or None when the state has none (older tick, full, a holding window with no
+    reset time, an override `until` out of range) or its `until` is past."""
     text = state.get("until_local")
     if not isinstance(text, str) or not text.strip():
         return None

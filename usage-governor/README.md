@@ -40,12 +40,15 @@ When the plugin loads under the default profile (gateway, desktop or CLI), it:
    `tick.py` (Hermes cron runs scripts from `HERMES_HOME/scripts/` only); the wrapper exits 0, silently,
    when the plugin directory is gone;
 2. creates the cron job when no job named `usage-governor` exists, paused ones included, through Hermes'
-   cron API (the one `hermes cron create` calls): schedule `every 1m`, no agent, script
-   `usage-governor-tick.py`, delivery `local`, failure delivery `local`.
+   cron API (the one `hermes cron create` calls): schedule `* * * * *`, no agent, script
+   `usage-governor-tick.py`, delivery `local`, failure delivery `local`. The schedule is a cron expression
+   because Hermes counts an `every 1m` job's next run from the end of the run, a few seconds after the
+   scheduler's 60 s wake, so such a job runs every 2 minutes; a cron job is due at each whole minute.
 
 Under any other profile it installs no job. Set `schedule: false` to stop it creating the job; remove
-or pause the job with `hermes cron`. A job that exists is never changed: delete it to have the next load
-create it again.
+or pause the job with `hermes cron`. On a default-profile load with `schedule` on, a job that exists is
+never changed, except one on the `every 1m` schedule (an earlier version's, or one set by hand): it moves to `* * * * *` (paused stays paused). Delete it
+to have the next load create it again.
 
 ## Enforcement
 
@@ -87,8 +90,9 @@ BLOCKED by usage-governor: delegate_task: option Deep is not allowed in reduced 
 ```
 
 The return time is the tick's `until_local` from `state.json` (see Files); the hook computes no time
-itself and reads no timezone or quiet hours. A state written by an older tick (no `until_local`), or
-one whose `until` is already past (the tick stopped), gives the message without a return time.
+itself and reads no timezone or quiet hours. A state written by an older tick (no `until_local`), one
+whose `until` is already past (the tick stopped), one where a window holding the mode has no reset
+time, or one whose override `until` is out of range gives the message without a return time.
 
 ## Desktop
 
@@ -118,8 +122,10 @@ Most restrictive first; the first rule that holds wins.
 | `reduced` | top >= `reduced_at` (50), or used today >= 0.6 × day budget |
 | `full` | otherwise |
 
-- top = the larger of the 5-hour and week %, skipping a window whose reset time is past (or unknown;
-  a reset time no date can hold, e.g. 1e20, counts as unknown).
+- top = the larger of the 5-hour and week %, skipping a window whose reset time is past. A window with
+  no reset time keeps its % (`hermes usage` can give `Current session` a % and a null `resets_at`); a reset
+  time no date can hold, e.g. 1e20, counts as none. With no week reset time the day budget is
+  `daily_percent_of_week`.
 - Day budget = max(`daily_percent_of_week`, round((100 − week %) / working days left before the week
   resets)), set at the day's first reading. The day starts at the minute the quiet hours end; before
   that minute it is the previous calendar date (the upstream rule: with quiet hours ending 08:00, 07:59 still
@@ -181,7 +187,7 @@ whatever profile runs the tick. Each JSON file is written to a temporary file, t
 | `reason` | why the reading is missing or unused, else null |
 | `override` | `{"active": bool, "until": epoch or null, "ignored": why override.json was ignored, or null}`; `until` is also null when the override's `until` is out of range, while the override stays active |
 | `quiet` | local time is inside `quiet_hours` |
-| `until` | epoch seconds the mode is expected to end; null in `full` unless an override is active, and null when the override's `until` is out of range |
+| `until` | epoch seconds the mode is expected to end; null in `full` unless an override is active, null when the override's `until` is out of range, and null when a window that holds the mode has no reset time |
 | `until_local` | `until` in the tick's `timezone`: `HH:MM` when today, else `Ddd HH:MM`; null when `until` is |
 | `day` | `{"day": "YYYY-MM-DD", "start": week % baseline, "budget": day budget, "used": week % used today}` |
 | `reviewed` | day (`YYYY-MM-DD`) of the last review line |
@@ -192,7 +198,8 @@ the quiet hours in `quiet`; the start of the next day (end of the quiet hours, o
 included) in `budget`; in `essential` and `reduced`, the LATEST of the resets of the windows at or above
 the mode's threshold (`essential_at` or `reduced_at`) and, when the day share holds the mode too (used
 today >= 0.8 or 0.6 × day budget), the next day's start, because the mode drops only when all of them
-have; with none of these, the next day's start.
+have; with none of these, the next day's start. When a window that holds the mode has no reset time, no
+return time is quoted (`until` and `until_local` are null).
 
 ### `journal.jsonl`
 

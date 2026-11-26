@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -179,7 +179,7 @@ class RulesTest(unittest.TestCase):
 
     def test_window_past_its_reset_is_skipped(self):
         self.assertIsNone(g.live(80, NOW - 1, NOW))
-        self.assertIsNone(g.live(80, None, NOW))
+        self.assertEqual(g.live(80, None, NOW), 80)  # no reset time: the % still counts
         self.assertEqual(g.live(80, NOW + 1, NOW), 80)
         self.assertEqual(self.mode(five=g.live(80, NOW - 1, NOW), week=10), "full")
 
@@ -297,6 +297,14 @@ class ReturnTimeTest(TmpCase):
         got = self.tick(reading=reading_of(doc(five=80, week=90, week_reset=week_first)))
         self.assertEqual(self.fields(got), ("essential", False, int(FIVE_RESET), "12:30"))
 
+    def test_holding_window_without_reset_quotes_no_time(self):
+        # Thu 14:00: the 5-hour window (95, no reset time) and the week (92, resets 14:30) hold essential;
+        # the mode drops only when both have reset, so 14:30 would be too early and no time is known.
+        thu = at("2026-11-26T14:00")
+        got = self.tick(now=thu, reading=reading_of(doc(five=95, week=92, fetched=thu, five_reset=None,
+                                                         week_reset=at("2026-11-26T14:30"))))
+        self.assertEqual(self.fields(got), ("essential", False, None, None))
+
     def test_essential_without_window_is_next_day(self):
         # Day share only (16 >= 0.8 x 20); the week (56) is under essential_at.
         self.tick(reading=reading_of(doc(five=10, week=40)))
@@ -369,7 +377,21 @@ class TickTest(TmpCase):
                 for name in ("state.json", "day.json"):
                     (self.tmp / name).unlink(missing_ok=True)
                 self.assertEqual(self.tick(reading=fixed(reset)), expected)
-                self.assertFalse((self.tmp / "day.json").exists())
+                self.assertEqual(json.loads((self.tmp / "day.json").read_text())["budget"], S.daily_percent)
+
+    def test_window_without_reset_time_keeps_its_percent(self):
+        # Real `hermes usage --json` (2026-11-26): `Current session` 0.0 with resets_at null (no 5-hour window
+        # running), `Current week` 100.0. The thresholds need only the %; the reset time stays unknown.
+        state = self.tick(reading=reading_of(doc(five=0.0, five_reset=None, week=100.0)))
+        self.assertEqual((state["five_hour"], state["seven_day"], state["mode"], state["source_ok"]),
+                         (0.0, 100.0, "essential", True))
+        self.assertNotIn("five_hour", state["resets"])
+        # Only the week holds the mode: its reset is the return time, though the 5-hour window has none.
+        self.assertEqual((state["until"], state["until_local"]), (int(WEEK_RESET), "Sun 05:00"))
+        self.assertEqual(self.journal()[-1]["five_hour"], 0.0)
+        state = self.tick(now=NOW + 60, reading=reading_of(doc(five=80.0, five_reset=None, week=10.0,
+                                                                  fetched=NOW + 60)))
+        self.assertEqual((state["five_hour"], state["mode"]), (80.0, "essential"))
 
     def test_reset_before_the_first_local_date_is_a_missing_reset(self):
         # The zero time 0001-01-01 UTC is year 0 in a zone west of UTC: formatting it would raise and skip the tick.
@@ -570,13 +592,18 @@ class FakeCron:
         if kw["action"] == self.fail:
             return {"success": False, "error": "nope"}
         if kw["action"] == "list":
-            return {"success": True, "jobs": list(self.jobs)}
-        self.jobs.append({"name": kw["name"]})
+            return {"success": True, "jobs": [dict(job) for job in self.jobs]}
+        if kw["action"] == "update":
+            # Hermes lists a job's schedule as its display string; a cron expression displays as itself.
+            next(job for job in self.jobs if job.get("job_id") == kw["job_id"])["schedule"] = kw["schedule"]
+            return {"success": True}
+        self.jobs.append({"job_id": "abc", "name": kw["name"], "schedule": kw["schedule"]})
         return {"success": True, "job_id": "abc"}
 
 
-CREATE = {"action": "create", "name": "usage-governor", "schedule": "every 1m", "no_agent": True,
+CREATE = {"action": "create", "name": "usage-governor", "schedule": "* * * * *", "no_agent": True,
           "script": "usage-governor-tick.py", "deliver": "local", "failure_deliver": "local"}
+LIST = {"action": "list", "include_disabled": True}
 
 
 class RegisterTest(TmpCase):
@@ -614,6 +641,22 @@ class RegisterTest(TmpCase):
         self.cron.jobs.append({"name": "usage-governor", "enabled": False})
         plugin.register(None)
         self.assertNotIn(CREATE, self.cron.calls)
+
+    def test_job_created_with_every_1m_moves_to_every_minute_once(self):
+        # An install from before the fix has `every 1m`, which runs every 2 minutes (see ScheduleCadenceTest).
+        self.cron.jobs.append({"job_id": "2643d14b6ba6", "name": "usage-governor", "schedule": "every 1m",
+                               "enabled": False})
+        plugin.register(None)
+        plugin.register(None)
+        self.assertEqual(self.cron.calls, [LIST, {"action": "update", "job_id": "2643d14b6ba6",
+                                                  "schedule": "* * * * *"}, LIST])
+        self.assertEqual(self.cron.jobs, [{"job_id": "2643d14b6ba6", "name": "usage-governor",
+                                           "schedule": "* * * * *", "enabled": False}])
+
+    def test_job_with_a_schedule_set_by_hand_is_kept(self):
+        self.cron.jobs.append({"job_id": "j1", "name": "usage-governor", "schedule": "every 5m"})
+        plugin.register(None)
+        self.assertEqual(self.cron.calls, [LIST])
 
     def test_other_profile_does_nothing(self):
         self.default = False
@@ -660,6 +703,25 @@ class RegisterTest(TmpCase):
         wrapper = plugin.write_wrapper(self.tmp / "b", fake)
         run = subprocess.run([sys.executable, str(wrapper), "--health"], capture_output=True, text=True, timeout=30)
         self.assertEqual(run.stdout, "ran ['--health']\n")
+
+
+class ScheduleCadenceTest(unittest.TestCase):
+    """JOB_SCHEDULE through Hermes' own schedule code: due again at the next ticker wake (one tick a minute)."""
+
+    def test_next_run_after_the_run_ends_is_due_at_the_next_wake(self):
+        try:
+            from cron.jobs import TICKER_INTERVAL_SECONDS, compute_next_run, parse_schedule
+        except Exception as exc:  # noqa: BLE001 - only Hermes' Python with hermes-agent on the path has it
+            self.skipTest(f"needs Hermes' cron (cron.jobs), see README Tests: {exc!r}")
+        schedule = parse_schedule(plugin.JOB_SCHEDULE)
+        wake = datetime(2026, 11, 26, 16, 0, 35, tzinfo=TZ)
+        # Hermes stamps last_run_at when the script ends and computes next_run_at from it (cron/jobs.py
+        # mark_job_run -> _advance_after_run -> compute_next_run); a tick takes a few seconds.
+        for took in (1, 5, 20):
+            with self.subTest(took=took):
+                end = wake + timedelta(seconds=took)
+                nxt = datetime.fromisoformat(compute_next_run(schedule, end.isoformat(), timezone="America/Toronto"))
+                self.assertLessEqual(nxt, wake + timedelta(seconds=TICKER_INTERVAL_SECONDS))
 
 
 @unittest.skipUnless(importlib.util.find_spec("hermes_cli"), "needs Hermes' Python (hermes_cli), see README Tests")

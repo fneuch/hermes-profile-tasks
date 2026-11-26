@@ -237,6 +237,15 @@ class MessageTest(Case):
         self.assertIn("in essential mode", msg)
         self.assertIn("Expected back at Sun 05:00 (local).", msg)
 
+    def test_message_from_a_real_tick_holding_window_without_reset(self):
+        # 5-hour window at 95 with no reset time, week at 92 resetting in 30 min: no return time is known.
+        def reading(now):
+            return (95.0, 92.0, {"five_hour": None, "seven_day": NOW + 1800}), ""
+        g.tick(now=NOW, data=self.tmp, read_settings_fn=lambda: S, reading=reading, out=io.StringIO())
+        msg = e.decide("profile_task", START, now=NOW, data=self.tmp, read_enforcement=lambda: RULES)["message"]
+        self.assertIn("in essential mode", msg)
+        self.assertNotIn("Expected back", msg)
+
     def test_missing_option_says_why(self):
         msg = self.message(state("reduced"), {"goal": "g"}, "delegate_task")
         self.assertIn("without an option is not allowed in reduced mode", msg)
