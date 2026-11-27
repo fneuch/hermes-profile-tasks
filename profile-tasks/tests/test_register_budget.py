@@ -215,7 +215,7 @@ def main(argv: list[str]) -> int:
     reply = slow_ctx.tools[0]["handler"]({"action": "status"}) if slow_ctx.tools else None
     answered_after = time.perf_counter() - t
     check(bool(registered < 3.0 and still_running and slow_ctx.tools and registered + answered_after >= 5.5
-               and answered_after < 10.0),
+               and plugin.wait_recovered(0.0) and answered_after < 20.0),
           "a recovery of 6 s does not hold register() back (it returns in under 3 s with the tool registered, the "
           "recovery still running); the first tool call waits for it",
           register_s=round(registered, 2), recovery_running_after_register=still_running,

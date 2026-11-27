@@ -12,7 +12,10 @@ Checks (the stop flag faked, no gateway):
    never (no wait_lost notice at all) after the withdrawal: the outcome does not depend on the timing;
 3. a withdrawal with no stop (a correction, a person) stays ``cancelled`` and "did not run", also across a restart;
 4. a definite outcome seen while stopping (the command ran, was denied, timed out) is kept;
-5. a record from before this field (no flag) keeps the timing rule: withdrawn within the grace of the cut = stop.
+5. a record from before this field (no flag) keeps the timing rule: withdrawn within the grace of the cut = stop;
+6. the stop flag does not outlive the restart notice it was recorded for: after the recovery, the task waits again
+   with a dead waiter and no new approval, and the next recovery does not report the old approval again, whichever
+   of the two recovery paths (cut-off wait, paused task) handled the first and the second restart.
 
 Run: ``PT_SCRIPT=tests/test_stop_cancel.py e2e/run.sh`` (isolated HOME/HERMES_HOME, the installed Hermes
 interpreter). ``e2e/run.sh <path to __init__.py>`` with that script runs it against another copy of the plugin.
@@ -166,6 +169,31 @@ def main() -> int:
           and not mod._ended_by_stop({}, approval | {"while_stopping": True, "outcome": "ran"}),
           "_ended_by_stop: a flagged cancelled/interrupted record is a stop at any timing; an unflagged one keeps "
           "the 5 s rule; a definite outcome is never one")
+
+    # 6. The flag ends with the notice it caused: a later restart does not repeat the old approval.
+    for first, second in (("running", "running"), ("running", "waiting_subwork"),
+                          ("waiting_subwork", "waiting_subwork"), ("waiting_subwork", "running")):
+        task_id = f"t-again-{first}-{second}"
+        prompt = approval_task(task_id)
+        end_approval(task_id, prompt, ("cancelled", "turn interrupted"), True)
+        plugin.store.update(task_id, status=first, pause_reasons=["a command"], waiter=dead)
+        plugin.recover_after_restart()
+        task = plugin.store.get(task_id)
+        first_text = outbox_text(task_id, "restart")
+        recovered = task.get("last_approval") or {}
+        # Back to waiting, its process gone again, nothing new asked: the follow-up of a recovered task.
+        plugin.store.update(task_id, status=second, pause_reasons=["a command"], waiter=dead, error=None)
+        before = len(plugin.store.get(task_id).get("outbox") or [])
+        plugin.recover_after_restart()
+        again = plugin.store.get(task_id)
+        second_notices = " ".join(e["text"] for e in (again.get("outbox") or [])[before:] if e["kind"] == "restart")
+        check(bool("whether the command ran is unknown" in first_text and "probe" in first_text
+                   and not recovered.get("while_stopping") and second_notices
+                   and "probe" not in second_notices and "unknown" not in second_notices
+                   and (again.get("last_approval") or {}).get("outcome") == "interrupted"),
+              f"a second restart does not repeat the old approval (first {first}, then {second})",
+              first_notice=first_text[-160:], second_notice=second_notices[-200:],
+              recovered_flag=recovered.get("while_stopping"))
 
     print("PASS" if not failures else "FAIL", flush=True)
     return 1 if failures else 0

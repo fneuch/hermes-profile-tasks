@@ -622,6 +622,16 @@ def _ended_by_stop(task: dict, last: dict) -> bool:
     return bool(cuts) and 0 <= max(cuts) - ended <= STOP_GRACE_SECONDS
 
 
+def _ended_with_restart(approval: dict) -> dict:
+    """The record kept for an approval the restart ended: interrupted, without the stop flag.
+
+    The flag only says the withdrawal happened while the gateway was stopping; it ends with the restart notice
+    that reported it, so a later restart does not report the same approval again.
+    """
+    return {**{k: v for k, v in approval.items() if k != "while_stopping"},
+            "outcome": "interrupted", "settled_at": time.time()}
+
+
 def _cut_approvals(task: dict) -> list[dict]:
     """The approvals a restart ended: the open ones, else the last one a stop withdrew or left unwatched."""
     approvals = list(_approvals(task).values())
@@ -2057,7 +2067,7 @@ class ProfileTasks:
             fields.update(_approval_fields({}))
         profile = task.get("profile")
         for approval in approvals:
-            fields["last_approval"] = {**approval, "outcome": "interrupted", "settled_at": time.time()}
+            fields["last_approval"] = _ended_with_restart(approval)
             text += (f" The approval for `{approval.get('command')}` ended with the restart: whether the command "
                      f"ran is unknown; check the {profile} session before running it again.")
         fields["outbox"] = list(task.get("outbox") or []) + [_notice(text, "restart")]
@@ -2117,7 +2127,7 @@ class ProfileTasks:
         else:
             parts.append(f" after the wait limit, while the {profile} session had an approval open.")
         for approval in approvals:
-            fields["last_approval"] = {**approval, "outcome": "interrupted", "settled_at": time.time()}
+            fields["last_approval"] = _ended_with_restart(approval)
             parts.append(f" The approval for `{approval.get('command')}` ended with the restart: whether the command "
                          f"ran is unknown; check the {profile} session before running it again.")
         fields["outbox"] = list(task.get("outbox") or []) + [_notice("".join(parts), "restart")]
