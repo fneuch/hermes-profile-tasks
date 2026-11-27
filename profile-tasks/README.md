@@ -39,7 +39,10 @@ profile served by the same Hermes gateway.
   It sends them once the gateway accepts plugin messages, then as above. When several processes load
   the plugin at once (a gateway launcher that then attaches to the running gateway, and that gateway),
   each task is closed and noticed by one of them only: the plugin state is read and written under a
-  lock file in the plugin's data folder.
+  lock file in the plugin's data folder. This runs in a background thread that `register()` starts, so
+  the load stays inside Hermes' 10 s plugin load limit (past it the tool is not registered at all); the
+  first `profile_task` call waits for it, at most 10 s. An approval withdrawn while the gateway was
+  stopping counts as ended by the restart, however long the stop took.
 - A task is followed to its real end. An observer per open task (its own connection to the target
   profile's gateway, bound to the task session) reads every event of the session. Every turn that
   ends there, whoever started it (an injection, a queued prompt, a finished background command), is
@@ -310,9 +313,18 @@ The isolated gateway is stopped through its own named pipe, and an unclean stop 
   from the named profile's state file and leaves that folder byte for byte as it was; a task save
   sends `plugin.profile-tasks.tasks.changed` only where the gateway server runs.
 - `PT_SCRIPT=tests/test_liveness.py e2e/run.sh`: the waiting-process check with `/proc` (Linux) and
-  with `/proc` hidden (the macOS path): a live waiter, a reused pid, a gone pid, a zombie. On
+  with `/proc` hidden (the macOS path): a live waiter, a reused pid, a gone pid, a zombie. The
+  tokens of the ended processes are the real ones, read while they were alive. On
   Windows only the `psutil` path exists: it also checks an exited process whose handle is still
   held, and that `os.kill` is never called.
+- `PT_SCRIPT=tests/test_register_budget.py e2e/run.sh [rounds] [processes] [plugin]`: `register()`
+  stays inside Hermes' 10 s plugin load limit: cold processes load the plugin at once over a long
+  task history with many cut-off tasks and every core busy, then the recovery that runs in the
+  background closes each task once; a slow, endless or failing recovery does not hold the load
+  back or break the tool.
+- `PT_SCRIPT=tests/test_stop_cancel.py e2e/run.sh`: an approval withdrawn while the gateway stops
+  is recorded and reported as unknown whatever the time between the withdrawal and the cut of the
+  wait; a withdrawal with no stop and a definite outcome keep theirs.
 - `PT_SCRIPT=tests/test_file_lock.py e2e/run.sh`: the lock on `tasks.lock` between processes: a
   second process waits for the holder, a killed holder releases it, a reader waits for a writer
   (two readers share the lock everywhere but Windows), the read of another profile's tasks waits

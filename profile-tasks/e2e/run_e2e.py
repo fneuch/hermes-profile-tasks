@@ -1069,6 +1069,15 @@ async def restart_gateway(ctx, how: str) -> dict:
     return stopped
 
 
+def plugin_load_report() -> dict:
+    """What the isolated gateways logged about loading profile-tasks: each register() time, each load failure."""
+    path = HH / "logs" / "agent.log"
+    text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+    return {"took_s": [float(s) for s in re.findall(r"profile-tasks: register\(\) took ([0-9.]+) s", text)],
+            "failed": [line[:300] for line in text.splitlines() if "Failed to load plugin 'profile-tasks'" in line],
+            "recovery_s": [float(s) for s in re.findall(r"profile-tasks: restart recovery done in ([0-9.]+) s", text)]}
+
+
 async def trial_restart(ctx) -> None:
     """Both restart kinds: at load the plugin finds the cut-off tasks and tells the manager conversation itself."""
     for how in ("socket", "kill"):
@@ -1108,6 +1117,12 @@ async def trial_restart(ctx) -> None:
                   f"manager is told it ended with the restart",
                   pending_before=pending, last_approval=approval_after.get("last_approval"),
                   pending_after=approval_after.get("pending_approval"), notice=told[1])
+            # Every load of the plugin so far (the first gateway start and each restart so far) fit Hermes' 10 s
+            # load limit: past it the tool is missing and every later trial fails with it.
+            report = plugin_load_report()
+            check("restart", bool(report["took_s"]) and max(report["took_s"]) < 8 and not report["failed"],
+                  f"after the {how} restart every load of the plugin fit Hermes' 10 s load limit (register() "
+                  f"under 8 s, no load failure logged)", **report)
             # Past the time the cut-off model call would have answered.
             await until(lambda: time.monotonic() >= hang_end, HANG_SECONDS + 60, "hang window over")
             again = await call_tool(ctx, mgr, sid, {"action": "status", "task_id": waiting}, "status")

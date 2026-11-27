@@ -76,7 +76,15 @@ cleanup() {
     isolated "$(native "$REPO")/e2e/stop_gateway.py" "$(native "$BASE")/home/.hermes" || status=1
   fi
   if [ "$status" -eq 0 ] && [ -z "${PT_E2E_KEEP:-}" ]; then
-    rm -rf "$BASE"
+    # Windows: a process just reaped may still hold a file for a moment ("Device or resource busy"). A leftover
+    # directory must not turn a passing run into a failing one: the next run removes it once it is a day old.
+    for _ in 1 2 3 4 5 6; do
+      rm -rf "$BASE" 2>/dev/null && break
+      sleep 2
+    done
+    if [ -d "$BASE" ]; then
+      echo "e2e: could not remove $BASE (a file is still in use); it is removed by a later run" >&2
+    fi
   else
     echo "e2e: kept $BASE" >&2
   fi
