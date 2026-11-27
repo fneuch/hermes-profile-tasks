@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
-import fcntl
+import errno
 import inspect
 import json
 import logging
@@ -26,6 +26,15 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+if os.name == "nt":
+    import msvcrt
+
+    fcntl = None
+else:
+    import fcntl
+
+    msvcrt = None
 
 logger = logging.getLogger(__name__)
 
@@ -275,9 +284,37 @@ class TaskStore:
         with _STATE_LOCK:
             path = Path(self._state.data_dir) / "tasks.lock"
             path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a+b") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            with open(path, "a+b") as handle, _file_lock(handle):
                 yield
+
+
+@contextlib.contextmanager
+def _file_lock(handle: Any, shared: bool = False):
+    """Hold a lock on the open file *handle* between processes until the block ends (or the file closes).
+
+    flock on Linux and macOS. Windows has no flock: the first byte of the file is locked with
+    ``msvcrt.locking``, retried until it is free; it has no shared mode, so a *shared* lock is exclusive there.
+    """
+    fd = handle.fileno()
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        yield
+        return
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            break
+        except OSError as exc:
+            # EACCES / EDEADLOCK: another handle holds the byte. Anything else is a real error.
+            if exc.errno not in (errno.EACCES, errno.EDEADLK, errno.EAGAIN):
+                raise
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 # ---- gateway client ---------------------------------------------------------------------------
@@ -493,14 +530,14 @@ class _Observer:
         # A connection with no event stream (nothing to read) has nothing to follow.
 
 
-# Process states of a process that no longer runs: Linux /proc letters, then psutil names (macOS).
+# Process states of a process that no longer runs: Linux /proc letters, then psutil names (macOS; Windows has none).
 _ENDED_STATES = ("Z", "X", "zombie", "dead")
 
 
 def _process_state(pid: int) -> tuple[str, str] | None:
     """(start time, state) of *pid*, or None when no such process can be read.
 
-    Read from /proc where there is one (Linux), else with psutil, a Hermes dependency (macOS).
+    Read from /proc where there is one (Linux), else with psutil, a Hermes dependency (macOS, Windows).
     """
     if Path("/proc/self/stat").exists():
         try:
@@ -527,12 +564,14 @@ def _waiter_alive(token: str | None) -> bool:
     if not token:
         return False
     pid = int(token.split(":", 1)[0])
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        pass
+    if os.name != "nt":
+        # Not on Windows: there signal 0 is CTRL_C_EVENT (a console event sent to a process group), no existence test.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass
     state = _process_state(pid)
     # A killed waiter stays a zombie until its parent reaps it; it no longer waits.
     if state is None or state[1] in _ENDED_STATES:
@@ -1312,9 +1351,7 @@ class ProfileTasks:
             except FileNotFoundError:
                 # No writer ever took the lock: nothing can be half written.
                 lock = contextlib.nullcontext()
-            with lock:
-                if hasattr(lock, "fileno"):
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+            with lock, (_file_lock(lock, shared=True) if hasattr(lock, "fileno") else contextlib.nullcontext()):
                 data = json.loads((folder / "state.json").read_text(encoding="utf-8-sig"))
         except FileNotFoundError:
             return {}

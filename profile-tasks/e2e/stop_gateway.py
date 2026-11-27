@@ -11,14 +11,36 @@ its run) is terminated, and killed if it does not exit.
 from __future__ import annotations
 
 import os
-import pwd
 import sys
 import time
 from pathlib import Path
 
-REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+def real_home() -> Path:
+    """The user's real home: from the password database, or ``PT_REAL_HOME`` where there is none (Windows)."""
+    try:
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except ImportError:
+        return Path(os.environ.get("PT_REAL_HOME") or Path.home())
+
+
+def real_hermes_homes() -> list[Path]:
+    """The live Hermes homes no run may touch: ``~/.hermes``, and on Windows the install under %LOCALAPPDATA%."""
+    homes = [real_home() / ".hermes"]
+    if os.environ.get("PT_REAL_HERMES"):
+        homes.append(Path(os.environ["PT_REAL_HERMES"]))
+    return [home.resolve() for home in homes]
+
+
+def is_real_home(home: Path) -> bool:
+    """Whether *home* is, or lies inside, a live Hermes home."""
+    home = home.resolve()
+    return any(home == real or real in home.parents for real in real_hermes_homes())
+
+
+REAL_HOME = real_home()
 ROOT = Path(os.environ.get("PT_E2E_ROOT") or REAL_HOME / ".cache/profile-tasks-e2e").resolve()
-REAL_HERMES = (REAL_HOME / ".hermes").resolve()
 
 
 def alive(pid: int) -> bool:
@@ -34,7 +56,7 @@ def stop(home: Path, wait: float = 90.0) -> bool:
     from gateway.control_socket import identify_gateway, pause_gateway_for_update
 
     home = home.resolve()
-    if home == REAL_HERMES or REAL_HERMES in home.parents or ROOT not in home.parents:
+    if is_real_home(home) or ROOT not in home.parents:
         print(f"REFUSED {home}: not an isolated e2e home under {ROOT}")
         return False
     ident = identify_gateway(home, timeout=5.0)
@@ -57,13 +79,16 @@ def reap(home: Path, wait: float = 10.0) -> int:
     import psutil
 
     home = home.resolve()
+    # Not this process nor the ones that started it: on Windows `env -i` stays alive as its parent,
+    # with the run's HERMES_HOME.
+    mine = {os.getpid(), *(parent.pid for parent in psutil.Process().parents())}
     left = []
     for proc in psutil.process_iter():
         try:
             value = proc.environ().get("HERMES_HOME")
         except (psutil.Error, OSError):
             continue
-        if proc.pid != os.getpid() and value and Path(value).resolve() == home:
+        if proc.pid not in mine and value and Path(value).resolve() == home:
             left.append(proc)
     for proc in left:
         try:
@@ -86,7 +111,7 @@ def main(argv: list[str]) -> int:
     for raw in argv:
         ok = stop(Path(raw)) and ok
         home = Path(raw).resolve()
-        if ROOT in home.parents and not (home == REAL_HERMES or REAL_HERMES in home.parents):
+        if ROOT in home.parents and not is_real_home(home):
             reap(home)
     return 0 if ok else 1
 

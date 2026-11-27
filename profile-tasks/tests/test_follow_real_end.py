@@ -424,7 +424,8 @@ def main() -> int:
           calls=new_calls)
     n = len(ctx.injected)
     gw.end_turn(f"adm-{gw.count}", "approved and finished")
-    wait_for(lambda: len(ctx.injected) > n)
+    # The approval's end notice and the answer are two injections, in that order, a moment apart.
+    wait_for(lambda: any(text.startswith("Answer from implementer") for text in ctx.injected[n:]))
     check(last_text().startswith("Answer from implementer"), "the turn after the approval still reaches the manager",
           injected=ctx.injected[n:])
 
