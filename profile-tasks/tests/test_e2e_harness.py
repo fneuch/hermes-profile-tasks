@@ -19,6 +19,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,20 @@ import time
 from pathlib import Path
 
 E2E = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "e2e")
+
+
+def find_bash() -> str:
+    """bash for run.sh; on Windows the one of Git for Windows (the first ``bash`` on PATH may be WSL's)."""
+    if os.name != "nt":
+        return "bash"
+    candidates = [os.environ.get("HERMES_GIT_BASH_PATH")]
+    git = shutil.which("git")
+    if git:
+        candidates += [Path(git).parent.parent / "bin" / "bash.exe", Path(git).parent / "bash.exe"]
+    return next((str(path) for path in candidates if path and Path(path).is_file()), "bash")
+
+
+BASH = find_bash()
 
 
 def load(name: str, path: Path):
@@ -97,10 +112,13 @@ def main() -> int:
         pathlib.Path.exists = real_exists
     check(result is False and error is None, "a gateway that exits while it is read is not alive, no error",
           result=result, error=error)
-    zombie = subprocess.Popen([sys.executable, "-c", "pass"])
-    os.waitid(os.P_PID, zombie.pid, os.WEXITED | os.WNOWAIT)
-    check(stop.alive(os.getpid()) and not stop.alive(zombie.pid), "a live process is alive, a zombie is not")
-    zombie.wait()
+    if hasattr(os, "waitid"):
+        zombie = subprocess.Popen([sys.executable, "-c", "pass"])
+        os.waitid(os.P_PID, zombie.pid, os.WEXITED | os.WNOWAIT)
+        check(stop.alive(os.getpid()) and not stop.alive(zombie.pid), "a live process is alive, a zombie is not")
+        zombie.wait()
+    else:
+        check(stop.alive(os.getpid()) and not stop.alive(gone.pid), "a live process is alive, an exited one is not")
 
     # 3. Two run.sh invocations started in the same second (date pinned) each get their own home.
     with tempfile.TemporaryDirectory() as box_dir:
@@ -113,7 +131,10 @@ def main() -> int:
         env = {"PATH": f"{box / 'bin'}:/usr/bin:/bin", "HOME": str(box), "PT_E2E_BASE": str(box / "runs"),
                "HERMES_PYTHON": sys.executable, "HERMES_AGENT_DIR": os.environ.get("PT_AGENT", ""),
                "PT_SCRIPT": os.path.relpath(script, E2E.parent)}
-        runs = [subprocess.Popen(["bash", str(E2E / "run.sh")], env=env, stdout=subprocess.PIPE,
+        if os.name == "nt":
+            # Git Bash finds its own tools through the Windows PATH, and the launcher reads the Windows variables.
+            env = {**os.environ, **env, "PATH": f"{box / 'bin'}{os.pathsep}{os.environ['PATH']}"}
+        runs = [subprocess.Popen([BASH, (E2E / "run.sh").as_posix()], env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True) for _ in range(2)]
         homes = [proc.communicate(timeout=60)[0].strip().splitlines()[-1:] for proc in runs]
         codes = [proc.returncode for proc in runs]
@@ -130,7 +151,8 @@ def main() -> int:
         other.mkdir()
         os.utime(other, (time.time() - 2 * 86400,) * 2)
         script.write_text("raise SystemExit(3)\n")
-        failed = subprocess.run(["bash", str(E2E / "run.sh")], env=env, capture_output=True, text=True, timeout=60)
+        failed = subprocess.run([BASH, (E2E / "run.sh").as_posix()], env=env, capture_output=True, text=True,
+                                timeout=60)
         left = sorted(p.name for p in (box / "runs").iterdir())
         kept = [name for name in left if name != other.name]
         check(failed.returncode == 3 and len(kept) == 1 and kept[0] != old.name and other.name in left
@@ -142,7 +164,9 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as box_dir:
         box = Path(box_dir)
         mine, other = box / "mine" / ".hermes", box / "other" / ".hermes"
-        hold = [sys.executable, "-c", "import time\nwhile True: time.sleep(1)"]
+        # The base interpreter: a virtual environment's python.exe on Windows is a launcher that starts a
+        # second process.
+        hold = [getattr(sys, "_base_executable", sys.executable), "-c", "import time\nwhile True: time.sleep(1)"]
         procs = [subprocess.Popen(hold, env={**os.environ, "HERMES_HOME": str(home)}) for home in (mine, mine, other)]
         try:
             count = stop.reap(mine, wait=5.0)

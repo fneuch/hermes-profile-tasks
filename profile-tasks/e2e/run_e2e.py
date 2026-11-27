@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import json
 import os
-import pwd
 import re
 import signal
 import sqlite3
@@ -30,14 +29,13 @@ from hermes_cli.observability.shared_metrics_consent import OFFER_VERSION
 from tests.fakes.fake_llm_provider import MODEL_ID, FakeLLMServer, Text, ToolCall
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from stop_gateway import alive, stop as stop_by_socket  # noqa: E402
+from stop_gateway import alive, is_real_home, stop as stop_by_socket  # noqa: E402
 
 HOME = Path(os.environ["HOME"])
 HH = Path(os.environ["HERMES_HOME"])
 REPO = Path(os.environ["PT_REPO"])
 AGENT = Path(os.environ["PT_AGENT"])
-REAL_ROOT = Path(pwd.getpwuid(os.getuid()).pw_dir, ".hermes").resolve()
-assert HH.resolve() != REAL_ROOT and REAL_ROOT not in HH.resolve().parents, "refusing the real Hermes home"
+assert not is_real_home(HH), "refusing the real Hermes home"
 assert HH == HOME / ".hermes"
 
 FIXTURE_MCP = AGENT / "tests/e2e/core/parity/fixture_mcp_server.py"
@@ -147,7 +145,7 @@ def analyst_model(record: dict):
         if not tool_results and tag == "APPROVALLATE":
             time.sleep(LATE_APPROVAL_DELAY)
         if not tool_results:
-            return ToolCall("terminal", {"command": f"rm -rf {HOME}/{tag.lower()}-probe-dir"})
+            return ToolCall("terminal", {"command": f"rm -rf {HOME.as_posix()}/{tag.lower()}-probe-dir"})
         return Text(f"{tag}-RESULT {text_of(tool_results[-1])[:400]}", reasoning=reasoning)
     if tag.startswith("REAUTH"):
         # REAUTH: one call; REAUTHAGAIN: two more, which opens Hermes' circuit breaker (3 failures).
@@ -186,6 +184,17 @@ def reviewer_model(record: dict):
 
 
 # ---- isolated home ------------------------------------------------------------------------------
+
+
+def link_dir(link: Path, target: Path) -> None:
+    """*link* is a folder that shows *target*: a symlink, or on Windows without the privilege a junction."""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            raise
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
 
 
 def write_home(manager_url: str, analyst_url: str, remote: dict[str, str], reviewer_url: str) -> None:
@@ -235,10 +244,10 @@ def write_home(manager_url: str, analyst_url: str, remote: dict[str, str], revie
         (homes[name] / ".env").write_text("OPENAI_API_KEY=sk-fake-e2e\n", encoding="utf-8")
     # The implementer hands work on itself, so it carries the plugin like the default profile.
     (homes["implementer"] / "plugins").mkdir(exist_ok=True)
-    (homes["implementer"] / "plugins/profile-tasks").symlink_to(REPO)
+    link_dir(homes["implementer"] / "plugins/profile-tasks", REPO)
     (HH / "plugins").mkdir(exist_ok=True)
-    (HH / "plugins/profile-tasks").symlink_to(REPO)
-    (HH / "plugins/pt-probe").symlink_to(REPO / "e2e/probe-plugin")
+    link_dir(HH / "plugins/profile-tasks", REPO)
+    link_dir(HH / "plugins/pt-probe", REPO / "e2e/probe-plugin")
     EVIDENCE["configs"] = {"default": default, "analyst": analyst, "implementer": implementer, "reviewer": reviewer}
 
 
@@ -260,7 +269,7 @@ class _Unauthorized(BaseHTTPRequestHandler):
 
 
 def _die_with_parent() -> None:
-    # Linux only: elsewhere the fixture is stopped by stop_remote_mcp, not by the parent's death.
+    # Linux only: elsewhere (macOS, Windows) the fixture is stopped by stop_remote_mcp, not by the parent's death.
     if sys.platform != "linux":
         return
     import ctypes
@@ -277,9 +286,12 @@ def start_remote_mcp() -> tuple[dict[str, str], list]:
     env = {"PATH": os.environ["PATH"], "HOME": str(HOME), "PYTHONPATH": str(AGENT), "MCPE2E_TRANSPORT": "http",
            "MCPE2E_PORT_FILE": str(root / "port"), "MCPE2E_LOG": str(root / "inbound.jsonl"),
            "MCPE2E_401_CALLS": str(root / "401_budget"), "MCPE2E_NAME": CALL_SERVER}
+    if os.name == "nt":
+        # Python and its sockets need these on Windows.
+        env.update({k: os.environ[k] for k in ("SYSTEMROOT", "TEMP", "TMP", "USERPROFILE") if k in os.environ})
     err = open(root / "stderr", "wb")
     proc = subprocess.Popen([sys.executable, str(HTTP_FIXTURE_MCP)], env=env, stdin=subprocess.DEVNULL,
-                            stdout=err, stderr=err, preexec_fn=_die_with_parent)
+                            stdout=err, stderr=err, preexec_fn=_die_with_parent if os.name == "posix" else None)
     deadline = time.monotonic() + 60
     while not (root / "port").exists():
         if proc.poll() is not None or time.monotonic() > deadline:
@@ -314,6 +326,13 @@ def start_gateway() -> subprocess.Popen:
                             cwd=AGENT, stdin=subprocess.DEVNULL, stdout=out, stderr=out)
     EVIDENCE["gateway_log"] = str(log_path)
     return proc
+
+
+def kill_process(pid: int) -> None:
+    """End *pid* at once, without letting it clean up (SIGKILL; TerminateProcess on Windows); gone is fine."""
+    import psutil
+    with contextlib.suppress(psutil.NoSuchProcess):
+        psutil.Process(pid).kill()
 
 
 def stop_gateway(proc: subprocess.Popen | None) -> None:
@@ -1024,16 +1043,16 @@ async def restart_gateway(ctx, how: str) -> dict:
     old = ctx["proc"]
     t0 = time.monotonic()
     if how == "kill":
-        # The child we start can attach to a host gateway it did not spawn; SIGKILL the pid that serves HH.
+        # The child we start can attach to a host gateway it did not spawn; kill the pid that serves HH
+        # (SIGKILL; TerminateProcess on Windows).
         host = int((identify_gateway(HH, timeout=5.0) or {}).get("pid") or 0)
         if not host:
             raise RuntimeError("no gateway answers on the isolated control socket")
-        os.kill(host, signal.SIGKILL)
+        kill_process(host)
         deadline = time.monotonic() + 30
         while alive(host) and time.monotonic() < deadline:
             await asyncio.sleep(0.2)
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(old.pid, signal.SIGKILL)
+        kill_process(old.pid)
         old.wait(30)
         stopped = {"how": how, "old_pid": host, "old_alive": alive(host),
                    "stop_seconds": round(time.monotonic() - t0, 1)}
