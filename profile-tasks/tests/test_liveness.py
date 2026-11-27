@@ -4,6 +4,9 @@ this is the only path, read with psutil).
 A live waiter is alive; the same pid with another start time, a pid that is gone, and a zombie (where the
 platform has them) are not. On Windows the check never calls ``os.kill``: signal 0 there is CTRL_C_EVENT.
 
+The tokens of the ended processes are the real ones, read while the process was alive: a made-up token such as
+``<pid>:1`` is refused by its start time alone, so it would pass even if an ended process read as alive.
+
 Run: ``PT_SCRIPT=tests/test_liveness.py e2e/run.sh`` (isolated HOME/HERMES_HOME, the installed Hermes
 interpreter). ``e2e/run.sh <path to __init__.py>`` with that script runs it against another copy of the plugin.
 """
@@ -59,32 +62,53 @@ def main() -> int:
         failures += not ok
         print("PASS" if ok else "FAIL", what, json.dumps(evidence, default=str)[:800], flush=True)
 
-    gone = subprocess.Popen([sys.executable, "-c", "pass"])
-    gone.wait()
+    def ended_waiter(release_handle: bool) -> dict:
+        """A process that ended after its token was read: the token is the real one, read while it was alive.
+
+        With *release_handle* False this process keeps the handle of the ended process (Windows lists such a
+        process without a state of its own); True closes it, so the pid is gone for good.
+        """
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        token = ""
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            token = mod._process_token(proc.pid)
+            if token.split(":", 1)[1]:
+                break
+            time.sleep(0.05)
+        alive_before = mod._waiter_alive(token)
+        proc.kill()
+        proc.wait(30)
+        if release_handle and getattr(proc, "_handle", None) is not None:
+            proc._handle.Close()  # Windows only: POSIX Popen has no handle
+        return {"proc": proc, "token": token, "alive_before": alive_before}
+
     zombie = None
     if hasattr(os, "waitid"):
         zombie = subprocess.Popen([sys.executable, "-c", "pass"])
         os.waitid(os.P_PID, zombie.pid, os.WEXITED | os.WNOWAIT)  # exited, not reaped: a zombie
-    # Exited, its handle still held by this process (Windows lists such a process without a state of its own).
-    exited = subprocess.Popen([sys.executable, "-c", "pass"])
-    deadline = time.monotonic() + 30
-    while exited.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.05)
 
     scopes = [("no /proc", without_proc)]
     if os.name != "nt":
         scopes.insert(0, ("/proc", contextlib.nullcontext))
+    gone_token = ""
     for path, scope in scopes:
         with scope():
             token = mod._process_token(os.getpid())
             pid, start = token.split(":", 1)
             check(bool(start) and mod._waiter_alive(token), f"{path}: a live waiter is alive", token=token)
             check(not mod._waiter_alive(f"{pid}:{start}0"), f"{path}: the same pid with another start time is not")
-            check(not mod._waiter_alive(f"{gone.pid}:1"), f"{path}: a pid that is gone is not alive")
+            # Tokens are read inside the scope: /proc and psutil format the start time differently.
+            for what, release in (("a pid that is gone", True), ("an exited waiter, its handle held", False)):
+                ended = ended_waiter(release)
+                check(ended["alive_before"] and not mod._waiter_alive(ended["token"]),
+                      f"{path}: {what} is not alive (real token, read while it was alive)",
+                      token=ended["token"], alive_before=ended["alive_before"])
+                if release:
+                    gone_token = ended["token"]
             if zombie is not None:
                 zombie_token = mod._process_token(zombie.pid)
                 check(not mod._waiter_alive(zombie_token), f"{path}: a zombie waiter is not alive", token=zombie_token)
-            check(not mod._waiter_alive(f"{exited.pid}:1"), f"{path}: an exited waiter, its handle held, is not alive")
     if zombie is not None:
         zombie.wait()
 
@@ -94,7 +118,7 @@ def main() -> int:
         real_kill = os.kill
         os.kill = lambda *args: calls.append(args)
         try:
-            alive_and_gone = (mod._waiter_alive(mod._process_token(os.getpid())), mod._waiter_alive(f"{gone.pid}:1"))
+            alive_and_gone = (mod._waiter_alive(mod._process_token(os.getpid())), mod._waiter_alive(gone_token))
         finally:
             os.kill = real_kill
         check(alive_and_gone == (True, False) and calls == [],
