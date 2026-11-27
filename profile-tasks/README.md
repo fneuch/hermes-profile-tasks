@@ -208,10 +208,23 @@ that session, whose `@session:` reference the notice gives. Unloading the plugin
 ## Enable
 
 Tested against Hermes Agent v0.23.3 (commit `caafe5389ae5`) and v0.23.2 (commit `ae2a81ccc00e`).
-Supported on Linux and macOS: the waiting-process check reads `/proc` on Linux and uses `psutil` (a
-Hermes dependency) on macOS. The tests run on Linux; they cover the macOS path by hiding `/proc`.
-Linux only in the e2e harness: the remote MCP fixture also dies with the harness process
-(`PR_SET_PDEATHSIG`); elsewhere the harness stops it on exit only.
+Supported on Linux, macOS and Windows (Windows 11 tested with v0.23.2 only). The waiting-process check
+reads `/proc` on Linux and uses `psutil` (a Hermes dependency) on macOS and Windows. The tests run on
+Linux and Windows; on Linux they cover the macOS path by hiding `/proc`. Linux only in the e2e
+harness: the remote MCP fixture also dies with the harness process (`PR_SET_PDEATHSIG`); elsewhere
+the harness stops it on exit only.
+
+Windows notes:
+
+- The default profile's home is `%LOCALAPPDATA%\hermes`, so its config file is
+  `%LOCALAPPDATA%\hermes\config.yaml` (step 2 below).
+- The lock on `tasks.lock`, taken by every process that loads the plugin, is `flock` on Linux and
+  macOS and a locked byte (`msvcrt.locking`) on Windows. Windows has no shared lock: the read of
+  another profile's tasks (the open sub-tasks check) takes the exclusive lock there, so a reader
+  waits for a writer and for another reader, for the few milliseconds of a read.
+- The waiting-process check never calls `os.kill(pid, 0)` on Windows: signal 0 is `CTRL_C_EVENT`
+  there, not an existence test. It reads the process start time and state with `psutil`.
+- A process killed while it holds the lock releases it, as on the other platforms.
 
 1. Install and enable the plugin in the default profile:
 
@@ -224,7 +237,7 @@ Linux only in the e2e harness: the remote MCP fixture also dies with the harness
    In the desktop, Skills > Plugins > Install from Git
    takes `fneuch/hermes-profile-tasks#profile-tasks`.
 
-2. In `~/.hermes/config.yaml`:
+2. In `~/.hermes/config.yaml` (Windows: `%LOCALAPPDATA%\hermes\config.yaml`):
 
    ```yaml
    plugins:
@@ -249,6 +262,14 @@ Update with `hermes plugins update profile-tasks`, then restart the gateway and 
 Both run against an isolated Hermes home under `~/.cache/profile-tasks-e2e/<timestamp>/`
 (fake `HOME`, own gateway, lock dir and runtime dir, fake LLM providers); the live install is
 only read (code and interpreter).
+
+On Windows run the same commands from Git Bash (`PT_SCRIPT=tests/test_liveness.py bash e2e/run.sh`).
+`e2e/run.sh` then reads the Hermes install from `%LOCALAPPDATA%\hermes` (`HERMES_INSTALL_ROOT` and
+`HERMES_AGENT_DIR` override it) and points `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`,
+`TEMP` and `HERMES_HOME` into the run directory. Hermes prepares its own Python environment in the
+isolated home at the first gateway start (about 500 MB, a few minutes); a passing run removes it.
+The isolated gateway is stopped through its own named pipe, and an unclean stop is killed with
+`TerminateProcess`, the Windows counterpart of the `SIGKILL` of the `restart` trial.
 
 - `PT_SCRIPT=tests/test_load_check.py e2e/run.sh`: load-time check, with all internals and with one removed.
 - `PT_SCRIPT=tests/test_mcp_reauth.py e2e/run.sh`: the `needs_reauth` tool-result notice (one per
@@ -289,7 +310,14 @@ only read (code and interpreter).
   from the named profile's state file and leaves that folder byte for byte as it was; a task save
   sends `plugin.profile-tasks.tasks.changed` only where the gateway server runs.
 - `PT_SCRIPT=tests/test_liveness.py e2e/run.sh`: the waiting-process check with `/proc` (Linux) and
-  with `/proc` hidden (the macOS path): a live waiter, a reused pid, a gone pid, a zombie.
+  with `/proc` hidden (the macOS path): a live waiter, a reused pid, a gone pid, a zombie. On
+  Windows only the `psutil` path exists: it also checks an exited process whose handle is still
+  held, and that `os.kill` is never called.
+- `PT_SCRIPT=tests/test_file_lock.py e2e/run.sh`: the lock on `tasks.lock` between processes: a
+  second process waits for the holder, a killed holder releases it, a reader waits for a writer
+  (two readers share the lock everywhere but Windows), the read of another profile's tasks waits
+  for that profile's writer, and four processes changing one task through
+  `TaskStore.modify` lose no update, where the same run without the lock does.
 - `PT_SCRIPT=tests/test_e2e_harness.py e2e/run.sh`: the probe plugin's response is never read half
   written; `e2e/stop_gateway.py` reads a gateway that exits while it is read as stopped and reaps
   only its own home's processes; `e2e/run.sh` removes a passing run's directory, keeps a failing one
@@ -309,7 +337,8 @@ only read (code and interpreter).
   new task that calls nothing, because Hermes' breaker is open.
 
 `e2e/run.sh` stops the isolated gateway on every exit (end, failure, Ctrl-C, TERM) through that
-home's own control socket (`e2e/stop_gateway.py HERMES_HOME`, which refuses the real `~/.hermes`),
+home's own control socket (`e2e/stop_gateway.py HERMES_HOME`, which refuses the real `~/.hermes`
+and, on Windows, the install under `%LOCALAPPDATA%\hermes`),
 then ends any process still running with that `HERMES_HOME`. The run's directory is removed after a
 passing run; a failing run keeps it (or any run with `PT_E2E_KEEP=1`) and run directories older
 than a day are removed at the next start; other entries under `PT_E2E_BASE` are left alone.
