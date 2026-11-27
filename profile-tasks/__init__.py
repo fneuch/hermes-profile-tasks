@@ -55,6 +55,11 @@ OUTBOX_RETRY_SECONDS = 60
 RELAY_RULE = "profile_task_relay"
 # A process that loads the plugin but never hosts the gateway (CLI, plugin listing) stops waiting after this.
 LOAD_FLUSH_WAIT_SECONDS = 300
+# Hermes gives import + register() 10 s (plugins.load_timeout_seconds); past it the tool is not registered at all.
+# register() therefore only starts the restart recovery (it can wait on the state lock of another loading
+# process, and grows with the task history); a tool call waits for it at most this long.
+RECOVERY_WAIT_SECONDS = 10
+LOAD_LIMIT_SECONDS = 10
 APPROVAL_OUTCOMES = ("denied", "timeout", "cancelled", "notify_failed", "blocked")
 # Target frames the waiter hands to the plugin: approvals, the tool result that shows how one ended, turn ends.
 WATCHED_FRAMES = ("approval.request", "approval.settled", "tool.start", "tool.complete", "message.complete")
@@ -277,6 +282,28 @@ class TaskStore:
             self._state.set(STATE_KEY, tasks)
         _announce(task_id)
         return task
+
+    def modify_all(self, change: Any) -> list[str]:
+        """``modify`` for every task in one locked step: one read, one write, however many tasks change.
+
+        ``change(task_id, task)`` returns the task's fields to store, or None to leave it; the ids of the tasks it
+        changed are returned. Each state read and write waits for the state lock of every other process that
+        uses it (Hermes polls that lock once a second on Windows), so a pass over all tasks must not lock per task.
+        ``change`` must not call the store.
+        """
+        changed: list[str] = []
+        with self._locked():
+            tasks = dict(self._state.get(STATE_KEY, {}) or {})
+            for task_id, task in list(tasks.items()):
+                fields = change(task_id, dict(task))
+                if fields is not None:
+                    tasks[task_id] = {**task, **fields, "updated_at": time.time()}
+                    changed.append(task_id)
+            if changed:
+                self._state.set(STATE_KEY, tasks)
+        for task_id in changed:
+            _announce(task_id)
+        return changed
 
     @contextlib.contextmanager
     def _locked(self):
@@ -581,7 +608,12 @@ def _waiter_alive(token: str | None) -> bool:
 
 def _ended_by_stop(task: dict, last: dict) -> bool:
     """True if the approval was withdrawn as the stopping gateway ended the turn, just before it cut the wait."""
-    if last.get("outcome") not in ("cancelled", "interrupted") or "raised_at" not in last:
+    if last.get("outcome") not in ("cancelled", "interrupted"):
+        return False
+    # Seen while the gateway was already stopping: no timing involved (how long a stop takes is not bounded).
+    if last.get("while_stopping"):
+        return True
+    if "raised_at" not in last:
         return False
     ended = last.get("settled_at") or last["raised_at"] + float(last.get("settled_after_s") or 0)
     # Only the latest cut can be this stop; an older one was an earlier, plain disconnect.
@@ -862,6 +894,10 @@ class ProfileTasks:
             return tool_error("profile_task is unavailable: this Hermes no longer has the internals it "
                               "depends on: " + "; ".join(self.missing))
         action = (args.get("action") or "").strip()
+        # The load did not wait for the restart recovery: the first call does, so it sees the tasks it closed.
+        if not self.wait_recovered():
+            logger.warning("profile-tasks: restart recovery still running after %s s; serving %s anyway",
+                           RECOVERY_WAIT_SECONDS, action or "a call")
         if self._gateway_host():
             self._flush_outbox("tool_call")
         try:
@@ -1508,6 +1544,12 @@ class ProfileTasks:
 
     def _approval_ended(self, task_id: str, prompt_id: str, outcome: tuple[str, str]) -> None:
         """Record how approval *prompt_id* really ended and tell the calling conversation, unless it answered it."""
+        # Read before the lock: the runner flags a stop before it interrupts any turn, so an approval withdrawn
+        # by that interruption is seen here with the flag already set, however long the stop then takes.
+        stopping = self._gateway_stopping()
+        if stopping and outcome[0] == "cancelled":
+            # The stop ended the turn: a withdrawal racing a person's answer cannot be told from it.
+            outcome = ("interrupted", outcome[1])
         # Under the relay lock so a card answered now either forwards first or sees the approval gone.
         with self._relay_lock:
             task = self.store.get(task_id) or {}
@@ -1515,6 +1557,8 @@ class ProfileTasks:
             if not approval:
                 return
             message, record = self._ended_text(task_id, task, approval, outcome)
+            if stopping:
+                record["while_stopping"] = True
             if self.store.modify(task_id, lambda t: {**_approval_fields(
                     {p: a for p, a in _approvals(t).items() if p != prompt_id}), "last_approval": record}
                     if prompt_id in _approvals(t) else None) is None:
@@ -1963,15 +2007,42 @@ class ProfileTasks:
     # gateway restart: found at load, told to each calling conversation
     def recover_after_restart(self) -> list[str]:
         """Close out tasks whose waiting process is gone; queue one notice each. Returns their ids."""
-        found = [task_id for task_id in self.store.all()
-                 if self.store.modify(task_id, lambda task, tid=task_id: self._close_cut_off(tid, task))]
-        for task_id in list(self.store.all()):
-            if self.store.modify(task_id, lambda task, tid=task_id: self._follow_again_fields(tid, task)):
-                threading.Thread(target=self._follow_again, args=(task_id,), name=f"profile-task-follow-{task_id}",
-                                 daemon=True).start()
+        # One locked pass each over all tasks (not a lock, a read and a write per task: the state lock of Hermes
+        # is polled once a second on Windows and every loading process wants it); only a task with a waiter can
+        # be cut off, so the finished ones (the history, which only grows) cost nothing.
+        found = self.store.modify_all(lambda task_id, task: self._close_cut_off(task_id, task) if task.get("waiter") else None)
+        followed = self.store.modify_all(
+            lambda task_id, task: self._follow_again_fields(task_id, task)
+            if task.get("waiter") and task.get("status") == "waiting_subwork" else None)
+        for task_id in followed:
+            threading.Thread(target=self._follow_again, args=(task_id,), name=f"profile-task-follow-{task_id}",
+                             daemon=True).start()
         if any(task.get("outbox") for task in self.store.all().values()):
             threading.Thread(target=self._flush_when_hosted, name="profile-tasks-load", daemon=True).start()
         return found
+
+    def start_recovery(self) -> None:
+        """Run recover_after_restart in the background: register() must return inside Hermes' load limit."""
+        self._recovered = threading.Event()
+
+        def run() -> None:
+            began = time.monotonic()
+            try:
+                recovered = self.recover_after_restart()
+                if recovered:
+                    logger.info("profile-tasks: tasks cut off by a gateway restart: %s", ", ".join(recovered))
+                logger.info("profile-tasks: restart recovery done in %.2f s", time.monotonic() - began)
+            except Exception:  # noqa: BLE001 - the tool stays usable; status finds a dead waiter itself
+                logger.warning("profile-tasks: restart recovery failed", exc_info=True)
+            finally:
+                self._recovered.set()
+
+        threading.Thread(target=run, name="profile-tasks-recovery", daemon=True).start()
+
+    def wait_recovered(self, timeout: float | None = None) -> bool:
+        """Wait until the restart recovery of this load is done (True at once if none was started)."""
+        event = getattr(self, "_recovered", None)
+        return event is None or event.wait(RECOVERY_WAIT_SECONDS if timeout is None else timeout)
 
     @staticmethod
     def _follow_again_fields(task_id: str, task: dict) -> dict | None:
@@ -2406,6 +2477,7 @@ def result(key: str, wait: float = 0.0) -> dict:
 
 def register(ctx: Any) -> None:
     global _PLUGIN
+    began = time.monotonic()
     missing = check_internals(ctx)
     soft = [m for m in missing if m.startswith(LIVE_SESSION_INTERNALS + STOP_INTERNALS)]
     missing = [m for m in missing if m not in soft]
@@ -2434,9 +2506,9 @@ def register(ctx: Any) -> None:
     if not missing:
         plugin._retry_thread = threading.Thread(target=plugin._retry_loop, name="profile-tasks-retry", daemon=True)
         plugin._retry_thread.start()
-        recovered = plugin.recover_after_restart()
-        if recovered:
-            logger.info("profile-tasks: tasks cut off by a gateway restart: %s", ", ".join(recovered))
+        plugin.start_recovery()
     ctx.register_tool(name=TOOL_NAME, toolset=TOOLSET, schema=SCHEMA, handler=plugin.handle,
                       description=SCHEMA["description"], emoji="📨")
     ctx.register_hook("post_approval_response", plugin.on_approval_response)
+    logger.info("profile-tasks: register() took %.2f s (Hermes allows %s s)", time.monotonic() - began,
+                LOAD_LIMIT_SECONDS)
